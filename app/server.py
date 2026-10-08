@@ -28,12 +28,14 @@ ROUTES = (
     ("shell", re.compile(r"^/orders/([^/]*)$")),
     ("content", re.compile(r"^/content/orders/([^/]*)$")),
 )
-SIGN_IN_RETURN_FALLBACK = "/"
 
 
 def route(path):
     """(kind, order_id) for a raw request path; the query string is dropped."""
-    path = urlsplit(path).path
+    try:
+        path = urlsplit(path).path
+    except ValueError:
+        return "other", None  # e.g. an absolute-form target with a bad host (E5)
     if path in STATIC_FILES:
         return "static", None
     for kind, pattern in ROUTES:
@@ -57,9 +59,11 @@ def handle(method, path, identify, load, banner):
     else:
         view = _signed_in_view(identify, Loading(order_id or None) if kind == "shell" else NotFound())
     if isinstance(view, SignedOut):
+        if kind == "other":
+            # no redirect off an unknown path such as /sign-in itself, or it would redirect to itself
+            return render(NotFound(), None)
         # rebuilt from the matched route, never from the query
-        view = SignedOut(f"/orders/{order_id}" if kind in ("shell", "content") else SIGN_IN_RETURN_FALLBACK)
-        return render(view, None)
+        return render(SignedOut(f"/orders/{order_id}"), None)
     return render(view, banner)
 
 
@@ -70,7 +74,7 @@ def _signed_in_view(identify, view):
     except Exception:
         return LoadError(False)
     if customer_id is None:
-        return SignedOut(SIGN_IN_RETURN_FALLBACK)
+        return SignedOut("/")
     return view
 
 

@@ -15,10 +15,37 @@
   var loadingNodes = Array.prototype.map.call(main.childNodes, function (node) {
     return node.cloneNode(true);
   });
+  var loadingTitle = document.title; // page.title or page.loading_title (R10)
   var failedRetries = 0;
 
+  function isLiveRegion(node) {
+    return node.nodeType === 1 && node.getAttribute("role") === "status";
+  }
+
+  // The role="status" region stays in the page and is cleared and refilled, so a
+  // repeated message is announced again (R16, E17). Everything else is swapped.
   function show(nodes, title) {
-    main.replaceChildren.apply(main, nodes);
+    var live = Array.prototype.filter.call(main.children, isLiveRegion)[0];
+    var incoming = nodes.filter(isLiveRegion)[0];
+    if (!live || !incoming) {
+      main.replaceChildren.apply(main, nodes);
+      document.title = title;
+      return;
+    }
+    Array.prototype.slice.call(main.childNodes).forEach(function (node) {
+      if (node !== live) {
+        main.removeChild(node);
+      }
+    });
+    var at = nodes.indexOf(incoming);
+    nodes.slice(0, at).forEach(function (node) {
+      main.insertBefore(node, live);
+    });
+    nodes.slice(at + 1).forEach(function (node) {
+      main.appendChild(node);
+    });
+    live.replaceChildren();
+    live.replaceChildren.apply(live, Array.prototype.slice.call(incoming.childNodes));
     document.title = title;
   }
 
@@ -91,7 +118,7 @@
     }
     show(loadingNodes.map(function (node) {
       return node.cloneNode(true);
-    }), document.title);
+    }), loadingTitle);
     focusFirst("[role='status'] [tabindex='-1']");
     load(true);
   });
