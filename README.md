@@ -1,10 +1,14 @@
 # Tripod example
 
-A real run of [Tripod](https://github.com/feronera/tripod) 0.5.1 on GitHub. One change, **order status history**, goes from the first intent to a merged pull request through all four gates. The run uses the real Claude Code plugins, real CI, branch protection and pull request approvals.
+Real runs of [Tripod](https://github.com/feronera/tripod) on GitHub, using the real Claude Code plugins, real CI, branch protection and pull request approvals. Two changes go from the first intent to a merged pull request through all four gates:
 
-- The pull request with the full history: [PR #1](https://github.com/feronera/tripod-example/pull/1)
-- The change folder: [docs/changes/001-order-history/](docs/changes/001-order-history/), with intent, UX brief, spec, plan, review, acceptance and `gates.log`
-- The code the agents wrote: [app/orders.py](app/orders.py), [app/timefmt.py](app/timefmt.py) and [tests/test_order_history.py](tests/test_order_history.py)
+- **Change 001, order status history (Risk: high).** People approve every step and a person merges. [PR #1](https://github.com/feronera/tripod-example/pull/1)
+- **Change 002, order status report (Risk: low).** The agent checks the rules and merges by itself, and SuperBiz accepts afterwards. [PR #5](https://github.com/feronera/tripod-example/pull/5) and [PR #6](https://github.com/feronera/tripod-example/pull/6)
+
+Where to look:
+
+- The change folders, with intent, spec, plan, review, acceptance and `gates.log`: [001-order-history](docs/changes/001-order-history/) and [002-status-report](docs/changes/002-status-report/)
+- The code the agents wrote: [app/orders.py](app/orders.py), [app/timefmt.py](app/timefmt.py), [tests/test_order_history.py](tests/test_order_history.py) and [tests/test_status_report.py](tests/test_status_report.py)
 - Each agent step's final reply: [run/agent-replies/](run/agent-replies/)
 
 The repository started from the Tripod template, so everything else here is the standard kit. The people and the support numbers are fictional demo data.
@@ -29,7 +33,7 @@ Demo limitation: only two GitHub accounts were available, so SuperBiz and escala
   - `claude-sonnet-5-5` for the `reviewer-second` agent, as the plugin specifies.
 - Non-interactive runs cannot ask follow-up questions, so the PO's answers were given in the prompts. In a normal session the skills ask them one at a time.
 
-## Timeline
+## Change 001: a high-risk change, merged by a person
 
 | Step | Who | What happened | Agent time | Cost (USD) |
 |---|---|---|---|---|
@@ -51,7 +55,26 @@ Demo limitation: only two GitHub accounts were available, so SuperBiz and escala
 
 `scripts/metrics.sh` measured 55 minutes from the first intent commit to gate 4, including the GitHub steps. Per-step costs are in [run/costs.tsv](run/costs.tsv).
 
-## What the run showed
+## Change 002: a low-risk change, merged by the agent
+
+An internal report for the support lead: the number of orders per status. It is not customer-facing, can be rolled back at once and holds no personal data, so the intent agent set Risk: low.
+
+| Step | Who | What happened | Agent time | Cost (USD) |
+|---|---|---|---|---|
+| 1 | Bee + agent | `/superbiz:intent`: Risk: low, and 3 open questions that the PO answered before gate 1 | 25 s | 0.49 |
+| 2 | Bee + agent | `/superbiz:spec` (no UI, so no UX brief). Two flagged concerns, both decided by people | 86 s | 0.61 |
+| 3 | Dan + agent | `/superdev:plan`. It noticed a test lock left over from change 001 | 74 s | 0.49 |
+| 4 | Dan + agent | `/superdev:test-first`, then Dan locked the tests | 270 s | 0.66 |
+| 5 | Dan + agent | `/superdev:build`: two units, `make check` green | 222 s | 0.50 |
+| 6 | Dan + agent | `/superdev:review`: 0 Blockers, second opinion agrees. Dan decided both open Majors | 231 s | 1.39 |
+| 7 | Dan + agent | `/superdev:merge`: `auto-merge-check` printed **ALLOW**. The agent recorded `role=auto`, pushed it, and ran `gh pr merge --auto --squash`. CI accepted the auto record with no human approval, and GitHub merged PR #5 | 216 s | 0.84 |
+| 8 | Bee + agent | `/superbiz:acceptance` after the merge, within the 48-hour window | 50 s | 0.49 |
+| Gate 4 | Bee, Dan | Signed after the merge. `release-check`: RELEASE-READY. The acceptance went to `main` in [PR #6](https://github.com/feronera/tripod-example/pull/6), approved by Dan | | |
+| **Total** | | | **about 20 min** | **about 5.5** |
+
+`scripts/metrics.sh` measured 19 minutes from the first signature to gate 4.
+
+## What the runs showed
 
 - **The agents were careful.**
   - The intent agent chose the higher risk tier and listed open questions instead of guessing.
@@ -60,7 +83,8 @@ Demo limitation: only two GitHub accounts were available, so SuperBiz and escala
 - **The guardrails held on GitHub.**
   - Branch protection refused the merge until the required `pod-gates` check passed.
   - `pr-check` failed without the approvals the risk tier needs, and passed once SuperBiz approved.
-  - The `gate-guard` hook stopped the agent's own `gh pr merge`.
+  - The `gate-guard` hook stopped the agent's own `gh pr merge` while gate 4 was incomplete.
+- **Auto-merge worked end to end for low risk.** The agent merged only after all nine conditions passed, CI re-checked its record, and the person-only steps (acceptance, revert) stayed with people.
 
 ## Auto-merge demo settings
 
@@ -73,4 +97,7 @@ Each of these is tracked as a fix in Tripod.
 1. **A stale failed check can keep a pull request blocked.**
    - CI runs on `pull_request` and again on `pull_request_review`. The run from before the approval fails and stays failed, so GitHub keeps blocking the merge even after the run triggered by the approval passes.
    - In this run, re-running the first check unblocked it. Tripod 0.5.2 now re-runs it automatically after an approval; [PR #3](https://github.com/feronera/tripod-example/pull/3) tested that fix here.
-2. **Branch protection needs a public repository or a paid GitHub plan.** On a free plan, `scripts/setup-github.sh` fails for private repositories with HTTP 403. This example is public for that reason.
+2. **Branch protection needs a public repository or a paid GitHub plan.** On a free plan, `scripts/setup-github.sh` fails for private repositories with HTTP 403. This example is public for that reason. Tripod 0.5.2 explains this instead of printing the raw error.
+3. **The post-merge acceptance PR was blocked forever.** After the squash auto-merge, `pr-check` re-checked the docs-only acceptance PR against the auto record, and the reviewed commit was no longer in history. Fixed in Tripod 0.5.3: docs-only PRs follow the normal approval rules ([PR #7](https://github.com/feronera/tripod-example/pull/7) brought the fix here).
+4. **A stale local `main` raised the risk.** The reviewers compared against an old local `main`, so an already-merged `pod.yml` change looked like part of change 002, which made it high risk. Since Tripod 0.5.3, the merge skill compares with `origin/main`.
+5. **Lead time after a squash merge read 0 minutes.** Squashing drops the branch history, so the first intent commit on `main` came after every gate. Since Tripod 0.5.4, `metrics.sh` starts from the first gate signature and says so.
