@@ -1,0 +1,9 @@
+01-intent	38	0.3881	12	claude-opus-5-5
+02-ux-brief	148	0.7191	11	claude-opus-5-5
+03-spec	152	0.8324	17	claude-opus-5-5
+04-plan	92	0.6283	15	claude-opus-5-5
+05-test-first	290	0.8591	21	claude-opus-5-5
+06-build	198	0.5994	22	claude-opus-5-5
+07-review	211	1.5694	29	claude-opus-5-5,claude-sonnet-5-5
+08-merge-too-early	18	0.2460	3	claude-haiku-4-5-20251001,claude-opus-5-5
+09-acceptance	206	0.6659	20	claude-opus-5-5
