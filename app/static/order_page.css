@@ -1,0 +1,75 @@
+/* Order page (change 003). Text colours aim for at least 4.5:1 contrast (R16); checked in the recorded demo (R19). */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 1rem;
+  max-width: 40rem;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 1rem;
+  line-height: 1.5;
+  color: #1a1a1a;
+  background: #ffffff;
+  /* E20: long ids and addresses wrap, so there is no horizontal scroll at 320 px or 200% zoom */
+  overflow-wrap: anywhere;
+}
+
+aside {
+  margin: 0 0 1rem;
+  padding: 0.5rem 0.75rem;
+  border: 2px solid #8a5a00;
+  color: #1a1a1a;
+  background: #fff4d6;
+}
+
+aside p,
+main p {
+  margin: 0 0 0.75rem;
+}
+
+h1 {
+  font-size: 1.5rem;
+  margin: 0 0 1rem;
+}
+
+h2 {
+  font-size: 1.25rem;
+  margin: 1.5rem 0 0.5rem;
+}
+
+.status-label {
+  font-weight: 600;
+}
+
+ol {
+  margin: 0 0 0.75rem;
+  padding-left: 1.5rem;
+}
+
+button {
+  font: inherit;
+  padding: 0.5rem 1rem;
+  border: 2px solid #1a4d8f;
+  border-radius: 4px;
+  color: #ffffff;
+  background: #1a4d8f;
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: 3px solid #1a4d8f;
+  outline-offset: 2px;
+}
+
+button:focus-visible {
+  outline-color: #1a1a1a;
+}
+
+[tabindex="-1"]:focus {
+  outline: none;
+}

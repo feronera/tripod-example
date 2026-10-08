@@ -1,0 +1,40 @@
+{
+  "timeout": {
+    "server": "run_demo.py --seed --demo-customer C001 --demo-delay-seconds 30",
+    "error_shown_after_ms": 10400
+  },
+  "session_expired": {
+    "server_before": "run_demo.py --seed --demo-customer C001 --demo-fail-loads 1",
+    "server_after": "run_demo.py --seed (no sign-in)",
+    "final_url": "http://127.0.0.1:9002/sign-in?return=/orders/A1001"
+  },
+  "after_first_failure": {
+    "focused": "<h1 tabindex=\"-1\">We couldn't load your order</h1>",
+    "live": [
+      {
+        "attr": "status",
+        "text": "Something went wrong. Check your connection and try again in a moment."
+      }
+    ],
+    "h1": "We couldn't load your order"
+  },
+  "after_failed_retry": {
+    "focused": "<h1 tabindex=\"-1\">We couldn't load your order</h1>",
+    "live": [
+      {
+        "attr": "status",
+        "text": "Something went wrong. Check your connection and try again in a moment."
+      }
+    ],
+    "h1": "We couldn't load your order"
+  },
+  "after_successful_retry": {
+    "focused": "<h1 tabindex=\"-1\">Order A1001</h1>",
+    "live": [],
+    "h1": "Order A1001"
+  },
+  "zoom_200": {
+    "horizontal_scroll": false,
+    "css_width": 640
+  }
+}

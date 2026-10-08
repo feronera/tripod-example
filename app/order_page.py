@@ -1,0 +1,262 @@
+"""Customer order status page (change 003): view records, copy and pure rendering.
+
+Everything a customer can see is produced here from plain values. The server only
+matches the path, calls one function and writes the returned Page.
+"""
+
+import html
+from string import Formatter
+from typing import NamedTuple
+from urllib.parse import quote
+
+from app.orders import OrderNotFound, status_history
+
+# R8, R9: defined once here; they reach the script through data- attributes.
+LOAD_TIMEOUT_SECONDS = 10
+SUPPORT_AFTER_FAILED_RETRIES = 3
+
+# Copy from ux-brief.md "Copy", exactly (R14).
+COPY = {
+    "demo.banner": "Demo sign-in: Customer {customer_id}",
+    "page.title": "Order {order_id}",
+    "page.loading_title": "Loading order",
+    "page.loading": "Loading your order…",
+    "status.heading": "Current status",
+    "status.updated": "Updated {datetime}",
+    "history.heading": "Status history",
+    "history.order": "Newest first",
+    "history.row": "{status_label} – {datetime}",
+    "history.empty": "No status updates are listed for this order.",
+    "history.earlier_note": "Earlier updates are not listed.",
+    "history.timezone": "Times are shown in Bangkok time (GMT+7).",
+    "error.not_found.title": "Order not found",
+    "error.not_found.body": (
+        "We couldn't find this order. Open the order link in your order confirmation email, "
+        "and check that you are signed in with the account you used to place the order."
+    ),
+    "error.load.title": "We couldn't load your order",
+    "error.load.body": "Something went wrong. Check your connection and try again in a moment.",
+    "error.load.retry": "Try again",
+    "error.load.support": "Still not working? Contact support at support@shop.example.",
+}
+
+SUPPORT_ADDRESS = "support@shop.example"
+
+
+class Loading(NamedTuple):
+    order_id: str | None  # None → title "Loading order" (E4)
+
+
+class Success(NamedTuple):
+    order_id: str
+    label: str
+    updated: dict | None  # {"text", "iso"}; None when the latest update is not the current status (E2)
+    history: tuple  # ((label, {"text", "iso"}), ...), newest first, non-empty
+
+
+class Empty(NamedTuple):
+    order_id: str
+    label: str
+
+
+class NotFound(NamedTuple):
+    """No fields: nothing order-specific can be shown (R7)."""
+
+
+class LoadError(NamedTuple):
+    show_support: bool  # True only after SUPPORT_AFTER_FAILED_RETRIES failed retries (R9)
+
+
+class SignedOut(NamedTuple):
+    return_path: str  # built by the server from the matched route, never from the query
+
+
+class Page(NamedTuple):
+    status: int
+    headers: tuple
+    body: bytes
+
+
+HEADERS = (
+    ("Content-Type", "text/html; charset=utf-8"),
+    ("Cache-Control", "no-store"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+    ("Content-Security-Policy",
+     "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'"),
+)
+
+
+def resolve(identify, order_id, load=status_history):
+    """The view for one order, in a fixed order of checks (R3, E13, E14).
+
+    The customer id comes only from identify(), so no request data can supply it (R2).
+    """
+    try:
+        customer_id = identify()
+    except Exception:
+        return LoadError(False)  # E14: the same for every order id
+    if customer_id is None:
+        return SignedOut(f"/orders/{order_id}")  # R3: load is never called
+    try:
+        result = load(customer_id, order_id)
+    except OrderNotFound:
+        return NotFound()  # R7: missing, another customer's or malformed
+    except Exception:
+        return LoadError(False)  # R8
+    if not result["history"]:
+        return Empty(result["order_id"], result["label"])
+    history = tuple((row["label"], row["time"]) for row in result["history"])
+    return Success(result["order_id"], result["label"], result["updated"], history)
+
+
+def _esc(value):
+    """The one way a value enters HTML (R17)."""
+    return html.escape(str(value), quote=True)
+
+
+def _fill(key, **markup):
+    """COPY[key] as HTML: its own text escaped, each {field} replaced by ready markup."""
+    out = []
+    for literal, field, _, _ in Formatter().parse(COPY[key]):
+        out.append(_esc(literal))
+        if field is not None:
+            out.append(markup[field])
+    return "".join(out)
+
+
+def _h1(text):
+    return f'<h1 tabindex="-1">{_esc(text)}</h1>'
+
+
+def _time(view):
+    return f'<time datetime="{_esc(view["iso"])}">{_esc(view["text"])}</time>'
+
+
+def _document(title, main, banner, main_attrs="", after_main=""):
+    aside = "" if banner is None else f'<aside aria-label="Demo notice"><p>{_esc(banner)}</p></aside>\n'
+    return (
+        "<!doctype html>\n"
+        '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"<title>{_esc(title)}</title>\n"
+        '<link rel="stylesheet" href="/static/order_page.css">\n'
+        "</head>\n<body>\n"
+        f"{aside}"
+        f"<main{main_attrs}>\n{main}\n</main>\n"
+        f"{after_main}"
+        "</body>\n</html>\n"
+    )
+
+
+def _order_main(order_id, label, updated, history):
+    """Success and Empty: current status, then the history section (ux-brief "Layout")."""
+    timezone_note = f'<p>{_esc(COPY["history.timezone"])}</p>'
+    status = [
+        f'<h2 id="status-heading">{_esc(COPY["status.heading"])}</h2>',
+        f'<p class="status-label">{_esc(label)}</p>',
+    ]
+    history_part = [f'<h2 id="history-heading">{_esc(COPY["history.heading"])}</h2>']
+    if updated is not None:
+        status += [f'<p>{_fill("status.updated", datetime=_time(updated))}</p>', timezone_note]
+    else:
+        history_part.append(timezone_note)
+    if history:
+        rows = "\n".join(
+            f'<li>{_fill("history.row", status_label=_esc(row_label), datetime=_time(at))}</li>'
+            for row_label, at in history
+        )
+        history_part += [
+            f'<p>{_esc(COPY["history.order"])}</p>',
+            f'<ol aria-label="Status history, newest first">\n{rows}\n</ol>',
+        ]
+    else:
+        history_part.append(f'<p>{_esc(COPY["history.empty"])}</p>')
+    history_part.append(f'<p>{_esc(COPY["history.earlier_note"])}</p>')
+    return "\n".join([
+        _h1(COPY["page.title"].format(order_id=order_id)),
+        '<section aria-labelledby="status-heading">', *status, "</section>",
+        '<section aria-labelledby="history-heading">', *history_part, "</section>",
+    ])
+
+
+def _not_found_main(view):
+    return "\n".join([
+        _h1(COPY["error.not_found.title"]),
+        f'<div role="status"><p>{_esc(COPY["error.not_found.body"])}</p></div>',
+    ])
+
+
+def _load_error_main(view):
+    lines = [f'<p>{_esc(COPY["error.load.body"])}</p>']
+    if view.show_support:
+        before, _, after = COPY["error.load.support"].partition(SUPPORT_ADDRESS)
+        lines.append(f"<p>{_esc(before)}<span>{_esc(SUPPORT_ADDRESS)}</span>{_esc(after)}</p>")
+    return "\n".join([
+        _h1(COPY["error.load.title"]),
+        f'<div role="status">{"".join(lines)}</div>',
+        f'<button type="button" data-action="retry">{_esc(COPY["error.load.retry"])}</button>',
+    ])
+
+
+def _page(status, title, main, banner):
+    return Page(status, HEADERS, _document(title, main, banner).encode("utf-8"))
+
+
+def _render_loading(view, banner):
+    # The shell: the script fetches /content/orders/{id} and swaps in its <main>.
+    # Both could-not-load variants are render's own markup, so JS writes no copy.
+    title = COPY["page.loading_title"] if view.order_id is None else COPY["page.title"].format(order_id=view.order_id)
+    main = "\n".join([
+        _h1(title),
+        f'<div role="status"><p tabindex="-1">{_esc(COPY["page.loading"])}</p></div>',
+    ])
+    main_attrs = (
+        f' data-load-timeout-seconds="{LOAD_TIMEOUT_SECONDS}"'
+        f' data-support-after="{SUPPORT_AFTER_FAILED_RETRIES}"'
+    )
+    after_main = (
+        f'<template id="tpl-load-error">\n{_load_error_main(LoadError(False))}\n</template>\n'
+        f'<template id="tpl-load-error-support">\n{_load_error_main(LoadError(True))}\n</template>\n'
+        '<script src="/static/order_page.js"></script>\n'
+    )
+    return Page(200, HEADERS, _document(title, main, banner, main_attrs, after_main).encode("utf-8"))
+
+
+def _render_success(view, banner):
+    main = _order_main(view.order_id, view.label, view.updated, view.history)
+    return _page(200, COPY["page.title"].format(order_id=view.order_id), main, banner)
+
+
+def _render_empty(view, banner):
+    main = _order_main(view.order_id, view.label, None, ())
+    return _page(200, COPY["page.title"].format(order_id=view.order_id), main, banner)
+
+
+def _render_not_found(view, banner):
+    return _page(404, COPY["error.not_found.title"], _not_found_main(view), banner)
+
+
+def _render_load_error(view, banner):
+    return _page(503, COPY["error.load.title"], _load_error_main(view), banner)
+
+
+def _render_signed_out(view, banner):
+    # R11, R12: a redirect with no body, so no banner and no order data
+    location = "/sign-in?return=" + quote(view.return_path, safe="/")
+    return Page(303, HEADERS + (("Location", location),), b"")
+
+
+_RENDER = {
+    Loading: _render_loading,
+    Success: _render_success,
+    Empty: _render_empty,
+    NotFound: _render_not_found,
+    LoadError: _render_load_error,
+    SignedOut: _render_signed_out,
+}
+
+
+def render(view, banner):
+    """The Page for one view; `banner` is the demo banner text, or None without the stand-in."""
+    return _RENDER[type(view)](view, banner)

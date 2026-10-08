@@ -1,0 +1,10 @@
+gate=1 role=owner by=bee@pod.example at=2026-10-09T03:32:18+07:00 blob=d219f0da67559554589f0b8979499ade3b7e70b6
+gate=1 role=cross by=dan@pod.example at=2026-10-09T03:33:04+07:00 blob=d219f0da67559554589f0b8979499ade3b7e70b6
+gate=2 role=owner by=bee@pod.example at=2026-10-09T03:38:26+07:00 blob=d02c55a1db9d5230e24acb66e5c93d6c7066ef10
+gate=2 role=cross by=dan@pod.example at=2026-10-09T03:38:29+07:00 blob=d02c55a1db9d5230e24acb66e5c93d6c7066ef10
+gate=2 role=escalation by=lee@pod.example at=2026-10-09T03:38:32+07:00 blob=d02c55a1db9d5230e24acb66e5c93d6c7066ef10
+gate=3 role=owner by=dan@pod.example at=2026-10-09T03:42:26+07:00 blob=8ae46a5be4462e829c0979fa6851c7dfd98d8d41
+gate=3 role=cross by=bee@pod.example at=2026-10-09T03:42:30+07:00 blob=8ae46a5be4462e829c0979fa6851c7dfd98d8d41
+gate=4 role=owner by=dan@pod.example at=2026-10-09T04:39:20+07:00 blob=b6fbf8752c793d991f1bc0c00a40386a5fb21205
+gate=4 role=cross by=bee@pod.example at=2026-10-09T04:39:23+07:00 blob=b6fbf8752c793d991f1bc0c00a40386a5fb21205
+gate=4 role=escalation by=lee@pod.example at=2026-10-09T04:39:28+07:00 blob=b6fbf8752c793d991f1bc0c00a40386a5fb21205
