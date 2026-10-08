@@ -7,3 +7,4 @@ gate=3 role=owner by=dan@pod.example at=2026-10-09T01:49:44+07:00 blob=333f6f61a
 gate=3 role=cross by=bee@pod.example at=2026-10-09T01:49:48+07:00 blob=333f6f61a918065003a794f4ec07d83d25e8a8a6
 gate=4 role=owner by=dan@pod.example at=2026-10-09T02:11:55+07:00 blob=f7f2e26c1b8123b3009f505564fe7e10242cebe3
 gate=4 role=cross by=bee@pod.example at=2026-10-09T02:11:59+07:00 blob=f7f2e26c1b8123b3009f505564fe7e10242cebe3
+gate=4 role=escalation by=lee@pod.example at=2026-10-09T02:12:03+07:00 blob=f7f2e26c1b8123b3009f505564fe7e10242cebe3
