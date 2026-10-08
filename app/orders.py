@@ -1,5 +1,10 @@
 """Order status lookup for customers (sample domain, in-memory data)."""
 
+from datetime import datetime, timezone
+from typing import NamedTuple
+
+from app.timefmt import time_view
+
 STATUS_LABELS = {
     "pending": "Awaiting payment",
     "paid": "Paid",
@@ -17,8 +22,42 @@ _ORDERS = {
 }
 
 
+class StatusUpdate(NamedTuple):
+    """One recorded status change; immutable once stored."""
+
+    order_id: str
+    status: str
+    at: datetime  # aware, normalized to UTC
+
+
+# Append-only, in record order, keyed by order id; lives for the process lifetime.
+_HISTORY = {}
+
+
 class OrderNotFound(LookupError):
     """Raised when an order does not exist or does not belong to the customer."""
+
+
+def set_status(order_id, status, at=None):
+    """Change an order's status and record the update; the only writer of status.
+
+    Returns False when the status is already current (nothing recorded).
+    Validation happens before any write, so a rejected call stores nothing.
+    """
+    order = _ORDERS.get(order_id)
+    if order is None:
+        raise OrderNotFound("Order not found")
+    if at is None:
+        at = datetime.now(timezone.utc)
+    elif at.tzinfo is None or at.utcoffset() is None:
+        raise ValueError("at must be timezone-aware")
+    if status == order["status"]:
+        return False
+    _ORDERS[order_id] = {**order, "status": status}
+    _HISTORY.setdefault(order_id, []).append(
+        StatusUpdate(order_id, status, at.astimezone(timezone.utc))
+    )
+    return True
 
 
 def get_order(order_id):
@@ -47,6 +86,30 @@ def status_for_customer(customer_id, order_id):
         "order_id": order_id,
         "status": order["status"],
         "label": status_label(order["status"]),
+    }
+
+
+def status_history(customer_id, order_id):
+    """Current status and recorded updates (newest first) of one order for its owner.
+
+    Uses the same access check as status_for_customer, so missing, other-customer
+    and malformed ids all raise the same OrderNotFound. The result is built fresh
+    from plain values, so editing it never changes stored history.
+    """
+    if not isinstance(customer_id, str) or not isinstance(order_id, str):
+        raise OrderNotFound("Order not found")
+    current = status_for_customer(customer_id, order_id)
+    updates = _HISTORY.get(order_id, [])
+    updated = None
+    if updates and updates[-1].status == current["status"]:
+        updated = time_view(updates[-1].at)
+    return {
+        **current,
+        "updated": updated,
+        "history": [
+            {"status": u.status, "label": status_label(u.status), "time": time_view(u.at)}
+            for u in reversed(updates)
+        ],
     }
 
 
