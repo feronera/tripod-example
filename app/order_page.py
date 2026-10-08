@@ -104,7 +104,11 @@ def _h1(text):
     return f'<h1 tabindex="-1">{_esc(text)}</h1>'
 
 
-def _document(title, main, banner, shell=""):
+def _time(view):
+    return f'<time datetime="{_esc(view["iso"])}">{_esc(view["text"])}</time>'
+
+
+def _document(title, main, banner, main_attrs="", after_main=""):
     aside = "" if banner is None else f'<aside aria-label="Demo notice"><p>{_esc(banner)}</p></aside>\n'
     return (
         "<!doctype html>\n"
@@ -114,9 +118,41 @@ def _document(title, main, banner, shell=""):
         '<link rel="stylesheet" href="/static/order_page.css">\n'
         "</head>\n<body>\n"
         f"{aside}"
-        f"<main{shell and ' ' + shell}>\n{main}\n</main>\n"
+        f"<main{main_attrs}>\n{main}\n</main>\n"
+        f"{after_main}"
         "</body>\n</html>\n"
     )
+
+
+def _order_main(order_id, label, updated, history):
+    """Success and Empty: current status, then the history section (ux-brief "Layout")."""
+    timezone_note = f'<p>{_esc(COPY["history.timezone"])}</p>'
+    status = [
+        f'<h2 id="status-heading">{_esc(COPY["status.heading"])}</h2>',
+        f'<p class="status-label">{_esc(label)}</p>',
+    ]
+    history_part = [f'<h2 id="history-heading">{_esc(COPY["history.heading"])}</h2>']
+    if updated is not None:
+        status += [f'<p>{_fill("status.updated", datetime=_time(updated))}</p>', timezone_note]
+    else:
+        history_part.append(timezone_note)
+    if history:
+        rows = "\n".join(
+            f'<li>{_fill("history.row", status_label=_esc(row_label), datetime=_time(at))}</li>'
+            for row_label, at in history
+        )
+        history_part += [
+            f'<p>{_esc(COPY["history.order"])}</p>',
+            f'<ol aria-label="Status history, newest first">\n{rows}\n</ol>',
+        ]
+    else:
+        history_part.append(f'<p>{_esc(COPY["history.empty"])}</p>')
+    history_part.append(f'<p>{_esc(COPY["history.earlier_note"])}</p>')
+    return "\n".join([
+        _h1(COPY["page.title"].format(order_id=order_id)),
+        '<section aria-labelledby="status-heading">', *status, "</section>",
+        '<section aria-labelledby="history-heading">', *history_part, "</section>",
+    ])
 
 
 def _not_found_main(view):
@@ -142,6 +178,36 @@ def _page(status, title, main, banner):
     return Page(status, HEADERS, _document(title, main, banner).encode("utf-8"))
 
 
+def _render_loading(view, banner):
+    # The shell: the script fetches /content/orders/{id} and swaps in its <main>.
+    # Both could-not-load variants are render's own markup, so JS writes no copy.
+    title = COPY["page.loading_title"] if view.order_id is None else COPY["page.title"].format(order_id=view.order_id)
+    main = "\n".join([
+        _h1(title),
+        f'<div role="status"><p tabindex="-1">{_esc(COPY["page.loading"])}</p></div>',
+    ])
+    main_attrs = (
+        f' data-load-timeout-seconds="{LOAD_TIMEOUT_SECONDS}"'
+        f' data-support-after="{SUPPORT_AFTER_FAILED_RETRIES}"'
+    )
+    after_main = (
+        f'<template id="tpl-load-error">\n{_load_error_main(LoadError(False))}\n</template>\n'
+        f'<template id="tpl-load-error-support">\n{_load_error_main(LoadError(True))}\n</template>\n'
+        '<script src="/static/order_page.js"></script>\n'
+    )
+    return Page(200, HEADERS, _document(title, main, banner, main_attrs, after_main).encode("utf-8"))
+
+
+def _render_success(view, banner):
+    main = _order_main(view.order_id, view.label, view.updated, view.history)
+    return _page(200, COPY["page.title"].format(order_id=view.order_id), main, banner)
+
+
+def _render_empty(view, banner):
+    main = _order_main(view.order_id, view.label, None, ())
+    return _page(200, COPY["page.title"].format(order_id=view.order_id), main, banner)
+
+
 def _render_not_found(view, banner):
     return _page(404, COPY["error.not_found.title"], _not_found_main(view), banner)
 
@@ -157,6 +223,9 @@ def _render_signed_out(view, banner):
 
 
 _RENDER = {
+    Loading: _render_loading,
+    Success: _render_success,
+    Empty: _render_empty,
     NotFound: _render_not_found,
     LoadError: _render_load_error,
     SignedOut: _render_signed_out,
