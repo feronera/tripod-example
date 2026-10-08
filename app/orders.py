@@ -1,5 +1,6 @@
 """Order status lookup for customers (sample domain, in-memory data)."""
 
+from collections import Counter
 from datetime import datetime, timezone
 from typing import NamedTuple
 
@@ -71,6 +72,24 @@ def get_order(order_id):
 def status_label(status):
     """Customer-facing label for a status code; unknown codes are shown as-is."""
     return STATUS_LABELS.get(status, status)
+
+
+def status_counts():
+    """Number of orders per current status, keyed by label (raw code when unlabelled).
+
+    Every label is present, with 0 when no order has it, in STATUS_LABELS order;
+    unlabelled codes follow, strings first in sorted order, then other values
+    (None, numbers) by their text, so mixed types never raise. Only status keys and int counts are returned, built
+    fresh on each call, so editing the result never changes stored orders.
+    """
+    counts = {label: 0 for label in STATUS_LABELS.values()}
+    tally = Counter(status_label(order["status"]) for order in _ORDERS.values())
+    for key in list(tally):
+        if key in counts:
+            counts[key] = tally.pop(key)
+    for key in sorted(tally, key=lambda k: (not isinstance(k, str), str(k))):
+        counts[key] = tally[key]
+    return counts
 
 
 def status_for_customer(customer_id, order_id):
