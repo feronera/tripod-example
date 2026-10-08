@@ -1,165 +1,73 @@
-# Tripod
+# Tripod example
 
-An agentic delivery practice for small teams. Agents draft the work of every role; a few accountable people make the decisions at defined gates, and the rules that matter are enforced by scripts, hooks and CI rather than by memory.
+A real run of [Tripod](https://github.com/feronera/tripod) 0.5.1 on GitHub. One change, **order status history**, goes from the first intent to a merged pull request through all four gates. The run uses the real Claude Code plugins, real CI, branch protection and pull request approvals.
 
-Tripod packages that practice as two Claude Code plugins, a set of gate scripts, document templates and a CI workflow. Start a new project from this template, or install it into an existing repository of any stack.
+- The pull request with the full history: [PR #1](https://github.com/feronera/tripod-example/pull/1)
+- The change folder: [docs/changes/001-order-history/](docs/changes/001-order-history/), with intent, UX brief, spec, plan, review, acceptance and `gates.log`
+- The code the agents wrote: [app/orders.py](app/orders.py), [app/timefmt.py](app/timefmt.py) and [tests/test_order_history.py](tests/test_order_history.py)
+- Each agent step's final reply: [run/agent-replies/](run/agent-replies/)
 
-## The three legs
+The repository started from the Tripod template, so everything else here is the standard kit. The people and the support numbers are fictional demo data.
 
-| Role | Covers | Decides | Status |
+## The team
+
+| Role | Person | Signs gates as (git email) | GitHub account |
 |---|---|---|---|
-| **SuperBiz** | PO, PM, BA, Designer | What to build and why | Available |
-| **SuperDev** | SA, Dev, QA, Deploy, Maintenance | How to build it, and whether it is safe | Available |
-| **SuperCEO** | Direction, priorities, high-risk approvals | Whether the risk is worth taking | Planned. The `escalation` role in `pod.yml` stands in today |
+| SuperBiz | Bee | `bee@pod.example` | `hx-natthawat` |
+| SuperDev | Dan | `dan@pod.example` | `feronera` |
+| Escalation | Lee | `lee@pod.example` | `hx-natthawat` |
 
-## How it works
+Demo limitation: only two GitHub accounts were available, so SuperBiz and escalation share one GitHub login. Gate signatures in `gates.log` still come from three different identities. In a real team, escalation is a third person.
 
-Every change moves through four gates. Each gate has an owner who approves and a second person who cross-checks, so the author and the approver are never the same person.
+## How the run worked
 
-| Gate | Artifact | Owner approves | Cross-check |
-|---|---|---|---|
-| 1 | `intent.md` | SuperBiz | SuperDev: feasible and measurable? |
-| 2 | `spec.md`, `ux-brief.md` | SuperBiz | SuperDev |
-| 3 | `plan.md` | SuperDev | SuperBiz: still matches the intent? |
-| 4 | Pull request, `acceptance.md` | SuperDev (code) | SuperBiz: accepted against the success measure |
+- Each person worked in their own clone with their own git identity.
+- Each agent step ran `claude -p` with only that person's plugin (`superbiz` or `superdev`) and a narrow list of allowed tools. See [run/ask.sh](run/ask.sh).
+- Every gate was signed by a person with `scripts/gate.sh`. Agents never signed.
+- Models:
+  - `claude-opus-5-5` for the main sessions.
+  - `claude-sonnet-5-5` for the `reviewer-second` agent, as the plugin specifies.
+- Non-interactive runs cannot ask follow-up questions, so the PO's answers were given in the prompts. In a normal session the skills ask them one at a time.
 
-Guardrails enforced by the kit:
+## Timeline
 
-- **Risk tiers.** Each intent declares `Risk: low | medium | high`. High-risk changes need an additional escalation approval at gates 2 and 4. Touching any path in `docs/risk-paths` raises a change to high, and risk can only go up.
-- **Stale approvals.** Every approval records the artifact's blob hash. Editing an artifact after approval invalidates the approval.
-- **WIP limit.** No more than `wip_limit` changes (default 2) may be open between gate 1 and gate 4.
-- **Merge by risk.** Gate 4 is split into merge-ready and release-ready.
-  - Low-risk changes may be merged by the agent once nine automated conditions pass.
-  - Medium-risk changes need SuperDev's approval.
-  - High-risk changes need all three approvers and a human merge.
-  - Auto-merge is off by default and is unlocked by a track record of clean changes.
-- **Verified identity.** CI checks pull request approvals on GitHub against the people listed in `pod.yml`.
+| Step | Who | What happened | Agent time | Cost (USD) |
+|---|---|---|---|---|
+| 1 | Bee + agent | `/superbiz:intent`: set Risk: high, because rolling back deletes recorded history. It also noticed that SuperBiz and escalation share a GitHub login | 38 s | 0.39 |
+| Gate 1 | Bee, Dan | Signed. Dan opened PR #1 as a draft, CI ran, and `pr-check` failed as expected because there was no approval yet | | |
+| 2 | Bee + agent | `/superbiz:ux-brief`: `ux-critic` found 5 Major issues, all fixed | 148 s | 0.72 |
+| 3 | Bee + agent | `/superbiz:spec`: `ba-researcher` cited exact code lines and raised 12 flagged concerns | 152 s | 0.83 |
+| Gate 2 | Bee, Dan, Lee | Bee and Dan recorded a decision on each concern in spec.md, then three signatures (Risk: high) | | |
+| 4 | Dan + agent | `/superdev:plan`: data shape, throughput checkpoint, rollback, and a plain summary for SuperBiz | 92 s | 0.63 |
+| Gate 3 | Dan, Bee | Bee cross-checked the summary against the intent | | |
+| 5 | Dan + agent | `/superdev:test-first`: failing tests from the spec, then Dan locked the tests | 290 s | 0.86 |
+| 6 | Dan + agent | `/superdev:build`: three units, one commit each. `make check`: 136 tests, no weak tests | 198 s | 0.60 |
+| 7 | Dan + agent | `/superdev:review`: three lenses plus `reviewer-second`. 0 Blockers, 1 Major, second opinion agrees | 211 s | 1.57 |
+| 8 | Dan + agent | Asked the agent to run `gh pr merge` before gate 4. The `gate-guard` hook blocked it | 18 s | 0.25 |
+| 9 | Bee + agent | `/superbiz:acceptance`: ran the demo against the real code and recorded the output | 206 s | 0.67 |
+| Gate 4 | Dan, Bee, Lee | Three signatures. `auto-merge-check`: DENY (auto-merge off, Risk high, no track record). `release-check`: RELEASE-READY | | |
+| Merge | Bee, then Dan | Merging before approval was refused by branch protection. Bee approved on GitHub, CI passed, and Dan merged | | |
+| **Total** | | | **about 23 min** | **about 6.5** |
 
-The kit has three layers:
+`scripts/metrics.sh` measured 55 minutes from the first intent commit to gate 4, including the GitHub steps. Per-step costs are in [run/costs.tsv](run/costs.tsv).
 
-1. **Governance.** Gates, cross-approval, risk tiers, the WIP limit, and an audit trail in each change's `gates.log`.
-2. **Engineering method.** Adapted from pstack (see [Credits](#credits)):
-   - Model the data shape before writing logic.
-   - Write a throughput checkpoint before splitting work.
-   - Work in small verifiable units.
-   - Test behavior, not implementation.
-   - Fix bugs at the root cause.
-   - Get a second opinion from a different model.
-   - Run a design bake-off when the approach is contested.
-3. **Enforcement.** The principles that matter are checked by scripts, hooks and CI, not left as guidance.
+## What the run showed
 
-## Quick start
+- **The agents were careful.**
+  - The intent agent chose the higher risk tier and listed open questions instead of guessing.
+  - The review ran on two different models, and they agreed.
+  - Every agent stopped before any decision that belonged to a person.
+- **The guardrails held on GitHub.**
+  - Branch protection refused the merge until the required `pod-gates` check passed.
+  - `pr-check` failed without the approvals the risk tier needs, and passed once SuperBiz approved.
+  - The `gate-guard` hook stopped the agent's own `gh pr merge`.
 
-Requirements: Python 3.10 or later, git, make and Claude Code. No other packages are needed.
+## Problems found
 
-### New project
+Each of these is tracked as a fix in Tripod.
 
-```bash
-gh repo create my-pod --private --template feronera/tripod --clone
-cd my-pod
-# Edit pod.yml: names, emails (must match each person's git config user.email) and GitHub logins
-make setup
-make check
-git add -A && git commit -m "chore: start pod"
-```
-
-### Existing project
-
-The installer works with any stack. It never overwrites `Makefile`, `AGENTS.md` or `CLAUDE.md`, and it can be re-run safely.
-
-```bash
-gh repo clone feronera/tripod ~/tripod
-cd ~/my-project && ~/tripod/scripts/pod-install.sh .
-```
-
-The installer detects Node, Python and Go projects, pre-fills the stack settings in `pod.yml` (`test_cmd`, `code_dirs`, `tests_dir`, `strength`), and prints the remaining steps. The full adoption guide, with a checklist, is in [docs/adopt.md](docs/adopt.md).
-
-### Plugins
-
-Each person installs the plugin for their role:
-
-```
-/plugin marketplace add feronera/tripod
-/plugin install superbiz@tripod     # or superdev@tripod
-```
-
-To try a plugin for one session without changing any settings, load it from a checkout:
-
-```bash
-claude --plugin-dir ./plugins/superbiz   # SuperBiz
-claude --plugin-dir ./plugins/superdev   # SuperDev
-```
-
-In projects without a `pod.yml`, the plugin hooks allow every action and print a one-line notice.
-
-## A change, end to end
-
-1. **SuperBiz** starts the change with `scripts/new-change.sh order-history` and drafts the intent with `/superbiz:intent`.
-2. **Gate 1.** SuperBiz signs with `scripts/gate.sh docs/changes/001-order-history 1`. SuperDev reviews the intent and runs the same command.
-3. **SuperBiz** writes the UX brief and spec with `/superbiz:ux-brief` and `/superbiz:spec`. Both sign gate 2.
-4. **SuperDev** writes the plan with `/superdev:plan`, covering the data shape, throughput checkpoint and parallel parts. Both sign gate 3.
-5. **SuperDev** writes tests first with `/superdev:test-first`, then builds with `/superdev:build` and reviews with `/superdev:review`, and opens a pull request.
-6. **SuperDev** merges according to risk with `/superdev:merge`.
-7. **SuperBiz** accepts the change with `/superbiz:acceptance` and signs gate 4. Depending on risk, acceptance happens before or after the merge.
-8. **SuperDev** releases with `/superdev:release` once `scripts/release-check.sh` passes, and SuperBiz publishes notes with `/superbiz:release-notes`.
-
-Use `/superdev:bug-fix` for defects and `/superdev:arena` when two designs need to be compared.
-
-## Plugins
-
-| Plugin | Skills | Agents | Hooks |
-|---|---|---|---|
-| `superbiz` | intent, ux-brief, spec, acceptance, release-notes | ba-researcher, ux-critic | biz-scope: SuperBiz edits `docs/` only |
-| `superdev` | plan, test-first, build, review, bug-fix, arena, merge, release, incident | reviewer, reviewer-second, monitor | kill-switch, protect-tests, gate-guard |
-
-## Commands
-
-| Command | Purpose |
-|---|---|
-| `make setup` | Check required tools and create the local `.pod/` folder |
-| `make test` | Run `test_cmd` from `pod.yml` |
-| `make strength` | Find weak tests, per the `strength` mode in `pod.yml` (see [docs/test-strength.md](docs/test-strength.md)) |
-| `make check` | Tests, test strength, the CODEOWNERS check and `gate-check --all`. CI runs this on every pull request |
-| `make metrics CHANGE=<dir>` | Time from the first intent commit to each gate, and the total lead time |
-| `scripts/new-change.sh <slug>` | Create `docs/changes/NNN-slug/intent.md`. Refused when the WIP limit is reached |
-| `scripts/gate.sh <dir> <1-4>` | Sign a gate as the current `git config user.email` and record it in `gates.log` |
-| `scripts/gate-check.sh <dir> [gate]` | Check one change's gates. Gate 4 means merge-ready for the change's risk |
-| `scripts/gate-check.sh --all` | Check every change. A change with no `gates.log` is treated as a draft |
-| `scripts/release-check.sh <dir>` | Release-ready: all gate 4 approvals present and current, no revert, and acceptance within the deadline |
-| `scripts/auto-merge-check.sh <dir> [--base main] [--record]` | `ALLOW` or `DENY`, with reasons, for an automated merge. `--record` logs the automated approval |
-| `scripts/mark-revert.sh <dir> "<reason>"` | Record that a change was reverted. Humans only |
-| `scripts/pr-check.sh` | CI: check GitHub approvals against the change's effective risk |
-| `scripts/sync-codeowners.sh [--check]` | Generate or verify `.github/CODEOWNERS` from `docs/risk-paths` |
-| `scripts/setup-github.sh <owner/repo> [--yes]` | Enable auto-merge and protect `main`. Prints the plan; applies it only with `--yes` |
-| `scripts/pod-install.sh <repo> [--with-sample] [--vendor-plugins] [--force]` | Install Tripod into another repository |
-| `touch .pod/lock-tests` | Lock the tests so agents cannot edit them |
-| `touch .pod/kill-switch` | Stop every agent that has the `superdev` plugin loaded |
-
-## Repository layout
-
-```
-AGENTS.md, CLAUDE.md     Rules for every agent working in the repository
-pod.yml                  Team members, GitHub logins, WIP limit, auto-merge and stack settings
-pod.mk, Makefile         Make targets (the Makefile includes pod.mk)
-plugins/                 The superbiz and superdev Claude Code plugins
-scripts/                 Gate, merge, metrics and installer scripts
-docs/                    Gates, risk tiers, risk paths, merge by risk, test strength,
-                         parallel agents, pod charter, adoption guide, credits
-docs/templates/          intent, ux-brief, spec, plan, review and acceptance templates
-docs/changes/            One folder per change (NNN-slug/)
-app/, tests/, logs/      Sample order-status service, its tests and a synthetic incident log
-.github/                 CI workflow (pod-gates) and the generated CODEOWNERS
-```
-
-## Operating notes
-
-- Agents never sign gates. Only humans run `scripts/gate.sh` and `scripts/mark-revert.sh`.
-- An agent may run `scripts/auto-merge-check.sh --record` followed by `gh pr merge --auto --squash` only when the check returns `ALLOW`.
-- `auto_merge` starts as `off`. Switch it to `low` once the team has the track record described in `docs/pod-charter.md`.
-- On GitHub, a pull request cannot be approved by its author. If the agent opens pull requests with SuperDev's account, SuperBiz's approval is required instead. See `docs/merge-by-risk.md`.
-- The `.pod/` folder holds per-machine state and is never committed.
-- All data in `app/` and `logs/` is synthetic.
-
-## Credits
-
-Several engineering methods are adapted from [pstack](https://github.com/cursor/plugins/tree/main/pstack) by Lauren Tan, used under the MIT License (Copyright (c) 2026 Lauren Tan). The adapted ideas are listed in [docs/credits.md](docs/credits.md).
+1. **A stale failed check can keep a pull request blocked.**
+   - CI runs on `pull_request` and again on `pull_request_review`. The run from before the approval fails and stays failed, so GitHub keeps blocking the merge even after the run triggered by the approval passes.
+   - In this run, re-running the first check unblocked it.
+2. **The repository owner can bypass the rules with `gh pr merge --admin`,** because branch protection did not include administrators.
+3. **Branch protection needs a public repository or a paid GitHub plan.** On a free plan, `scripts/setup-github.sh` fails for private repositories with HTTP 403. This example is public for that reason.
