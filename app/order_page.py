@@ -9,6 +9,8 @@ from string import Formatter
 from typing import NamedTuple
 from urllib.parse import quote
 
+from app.orders import OrderNotFound, status_history
+
 # R8, R9: defined once here; they reach the script through data- attributes.
 LOAD_TIMEOUT_SECONDS = 10
 SUPPORT_AFTER_FAILED_RETRIES = 3
@@ -83,6 +85,29 @@ HEADERS = (
     ("Content-Security-Policy",
      "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'"),
 )
+
+
+def resolve(identify, order_id, load=status_history):
+    """The view for one order, in a fixed order of checks (R3, E13, E14).
+
+    The customer id comes only from identify(), so no request data can supply it (R2).
+    """
+    try:
+        customer_id = identify()
+    except Exception:
+        return LoadError(False)  # E14: the same for every order id
+    if customer_id is None:
+        return SignedOut(f"/orders/{order_id}")  # R3: load is never called
+    try:
+        result = load(customer_id, order_id)
+    except OrderNotFound:
+        return NotFound()  # R7: missing, another customer's or malformed
+    except Exception:
+        return LoadError(False)  # R8
+    if not result["history"]:
+        return Empty(result["order_id"], result["label"])
+    history = tuple((row["label"], row["time"]) for row in result["history"])
+    return Success(result["order_id"], result["label"], result["updated"], history)
 
 
 def _esc(value):
