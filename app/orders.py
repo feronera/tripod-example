@@ -3,6 +3,8 @@
 from datetime import datetime, timezone
 from typing import NamedTuple
 
+from app.timefmt import time_view
+
 STATUS_LABELS = {
     "pending": "Awaiting payment",
     "paid": "Paid",
@@ -84,6 +86,30 @@ def status_for_customer(customer_id, order_id):
         "order_id": order_id,
         "status": order["status"],
         "label": status_label(order["status"]),
+    }
+
+
+def status_history(customer_id, order_id):
+    """Current status and recorded updates (newest first) of one order for its owner.
+
+    Uses the same access check as status_for_customer, so missing, other-customer
+    and malformed ids all raise the same OrderNotFound. The result is built fresh
+    from plain values, so editing it never changes stored history.
+    """
+    if not isinstance(customer_id, str) or not isinstance(order_id, str):
+        raise OrderNotFound("Order not found")
+    current = status_for_customer(customer_id, order_id)
+    updates = _HISTORY.get(order_id, [])
+    updated = None
+    if updates and updates[-1].status == current["status"]:
+        updated = time_view(updates[-1].at)
+    return {
+        **current,
+        "updated": updated,
+        "history": [
+            {"status": u.status, "label": status_label(u.status), "time": time_view(u.at)}
+            for u in reversed(updates)
+        ],
     }
 
 
