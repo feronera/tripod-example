@@ -62,6 +62,10 @@ Demo limitation: only two GitHub accounts were available, so SuperBiz and escala
   - `pr-check` failed without the approvals the risk tier needs, and passed once SuperBiz approved.
   - The `gate-guard` hook stopped the agent's own `gh pr merge`.
 
+## Auto-merge demo settings
+
+To test agent auto-merge for low-risk work, `pod.yml` sets `auto_merge: low` and `auto_merge_min_track: 1` (the default track record is 10 changes). Change 001 counts as that track record. A real team starts with `auto_merge: off`.
+
 ## Problems found
 
 Each of these is tracked as a fix in Tripod.

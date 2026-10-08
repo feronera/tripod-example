@@ -14,9 +14,9 @@ superbiz_github: hx-natthawat
 superdev_github: feronera
 escalation_github: hx-natthawat
 # Merge by risk: see docs/merge-by-risk.md
-auto_merge: off            # off | low
+auto_merge: low            # off | low
 auto_merge_max_lines: 200
-auto_merge_min_track: 10   # recent completed changes with no revert needed before auto-merge is allowed
+auto_merge_min_track: 1   # recent completed changes with no revert needed before auto-merge is allowed
 acceptance_hours: 48
 # Project stack: see docs/test-strength.md
 test_cmd: python3 -m unittest discover -s tests -t . -v
