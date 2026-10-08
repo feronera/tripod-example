@@ -50,3 +50,7 @@ Diff reviewed: `git diff main...HEAD` (app/orders.py, tests/test_status_report.p
 ## Checks
 - `make check`: pass. 150 tests OK, CODEOWNERS matches docs/risk-paths, and `gate-check --all` is OK (002 passed up to gate 3).
 - `scripts/test-strength.sh`: pass. It checked 47 tests and found no weak tests.
+
+## Decisions on open Majors (SuperDev, before merge)
+- Major 1 (pod.yml and README in the diff): false positive. The reviewers compared against a stale local `main`. Those commits are already on `origin/main` through PR #4, which was approved by a person; against `origin/main` the diff contains only this change's files.
+- Major 2 (unhashable status raises): accepted as out of scope, as recorded in spec.md decision 1. Status validation in `set_status` is a separate change.
