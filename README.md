@@ -1,9 +1,12 @@
 # Tripod example
 
-Real runs of [Tripod](https://github.com/feronera/tripod) on GitHub, using the real Claude Code plugins, real CI, branch protection and pull request approvals. Two changes go from the first intent to a merged pull request through all four gates:
+Real runs of [Tripod](https://github.com/feronera/tripod) on GitHub, using the real Claude Code plugins, real CI, branch protection and pull request approvals. Three changes go from the first intent to a merged pull request through all four gates:
 
 - **Change 001, order status history (Risk: high).** People approve every step and a person merges. [PR #1](https://github.com/feronera/tripod-example/pull/1)
 - **Change 002, order status report (Risk: low).** The agent checks the rules and merges by itself, and SuperBiz accepts afterwards. [PR #5](https://github.com/feronera/tripod-example/pull/5) and [PR #6](https://github.com/feronera/tripod-example/pull/6)
+- **Change 003, customer order page (Risk: high).** A real UI, built by two agents in parallel and accepted on the third try. [PR #9](https://github.com/feronera/tripod-example/pull/9)
+
+![The order page, success state](docs/changes/003-order-page/demo/desktop-1-success.png)
 
 Where to look:
 
@@ -74,6 +77,29 @@ An internal report for the support lead: the number of orders per status. It is 
 
 `scripts/metrics.sh` measured 19 minutes from the first signature to gate 4.
 
+## Change 003: the customer order page, built in parallel
+
+The page from the change 001 UX brief, served by a small Python standard-library server. Start it with
+`python3 -m app.server --demo-customer C001`, then open <http://127.0.0.1:8000/orders/A1001>.
+
+| Success | Not found | Could not load, after 3 retries | Mobile |
+|---|---|---|---|
+| ![](docs/changes/003-order-page/demo/desktop-1-success.png) | ![](docs/changes/003-order-page/demo/desktop-3-not-found-other-customer.png) | ![](docs/changes/003-order-page/demo/desktop-6-after-3-retries.png) | ![](docs/changes/003-order-page/demo/mobile-1-success.png) |
+
+Every state is recorded in [docs/changes/003-order-page/demo/](docs/changes/003-order-page/demo/), with a [recording log](docs/changes/003-order-page/demo/README.md) and measured evidence.
+
+| Step | What happened | Cost (USD) |
+|---|---|---|
+| Intent | The agent set Risk: high. This is the first code that turns a signed-in customer id into order access, and the pod charter treats sign-in work as high | 0.48 |
+| UX brief and spec | The UX brief was reused from change 001. Spec had 7 flagged concerns, decided by Bee, Dan and Lee | 2.17 |
+| Plan | Two parallel parts: A, page rendering, and B, server and demo sign-in, with no shared files | 1.06 |
+| Tests first | Separate test files per part, then locked | 2.53 |
+| Parallel build | Two agents in two git worktrees at the same time. 185 s wall time against about 323 s one after the other. Part B's tests needed part A's code, so B finished after A was merged in | 3.17 |
+| Review | 0 Blockers. The reviewers fixed a sign-in redirect loop and a bad-request case themselves. Dan unlocked the tests to add regression tests for those fixes, then locked them again | 4.35 |
+| Acceptance | **Rejected twice, accepted on the third pass.** First, one screenshot was wrong (a demo server had used up its failures). Second, timing, session expiry, focus and 200% zoom had no evidence. After they were recorded, it was accepted with conditions before release (a screen reader check and a release date) | 3.33 |
+| Gate 4 and merge | Three signatures, Bee approved on GitHub, Dan merged (high risk: a person merges) | |
+| **Total** | about 54 min of agent time | **about 17.1** |
+
 ## What the runs showed
 
 - **The agents were careful.**
@@ -84,6 +110,8 @@ An internal report for the support lead: the number of orders per status. It is 
   - Branch protection refused the merge until the required `pod-gates` check passed.
   - `pr-check` failed without the approvals the risk tier needs, and passed once SuperBiz approved.
   - The `gate-guard` hook stopped the agent's own `gh pr merge` while gate 4 was incomplete.
+- **Parallel agents worked when the files are separate.** Tests that cross parts still have to wait for the merge, so the plan should keep each part's tests runnable on their own.
+- **Acceptance caught real gaps.** It refused to accept a page whose recorded demo did not prove the spec, including a mistake in how the demo was recorded.
 - **Auto-merge worked end to end for low risk.** The agent merged only after all nine conditions passed, CI re-checked its record, and the person-only steps (acceptance, revert) stayed with people.
 
 ## Auto-merge demo settings
