@@ -87,3 +87,7 @@ Open (human decision needed):
 - `make check`: pass at a0df1ce (211 tests OK, CODEOWNERS OK, `gate-check.sh --all` OK; 003 has passed up to gate 3).
 - `scripts/test-strength.sh`: pass ("checked 106 tests, no weak tests").
 - The JS change was not syntax-checked by machine (`node --check` needed approval in this run). Exercise it in the R19 demo before acceptance.
+
+## Decisions on open Majors (SuperDev, before gate 4)
+- Major 1: closed. SuperDev unlocked the tests, the two regression tests were added in their own commit, and the tests were locked again.
+- Major 2: accepted. A signed-out request to an unknown path returns not-found instead of redirecting to sign-in; this is safer than plan.md:76 and is recorded here instead of re-signing gate 3.
