@@ -1,0 +1,10 @@
+# docs/risk-paths: sensitive paths, one glob per line
+# A change that touches any of these paths is always Risk: high, whatever intent.md declares
+# After editing this file, run scripts/sync-codeowners.sh to update .github/CODEOWNERS
+app/auth*
+app/payment*
+**/migrations/**
+.github/**
+pod.yml
+scripts/**
+plugins/**/hooks/**

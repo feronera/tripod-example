@@ -1,0 +1,34 @@
+name: pod-gates
+
+on:
+  pull_request:
+  pull_request_review:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pod-gates:
+    name: pod-gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # check the PR head itself (review.md reviewed_head is compared with HEAD)
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Configure git identity for script tests
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.com"
+      # Non-Python project: add steps that install the project stack here (e.g. actions/setup-node and npm ci)
+      - name: Tests and gate check
+        run: make -f pod.mk pod-check
+      - name: Approvals by risk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/pr-check.sh
