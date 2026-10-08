@@ -7,3 +7,13 @@
 07-review	211	1.5694	29	claude-opus-5-5,claude-sonnet-5-5
 08-merge-too-early	18	0.2460	3	claude-haiku-4-5-20251001,claude-opus-5-5
 09-acceptance	206	0.6659	20	claude-opus-5-5
+10-intent-002	25	0.4882	10	claude-opus-5-5
+11-spec-002	86	0.6055	9	claude-opus-5-5
+12-plan-002	74	0.4894	14	claude-opus-5-5
+13-test-first-002	270	0.6646	23	claude-opus-5-5
+14-build-002	222	0.4975	18	claude-opus-5-5
+15-review-002	231	1.3876	17	claude-opus-5-5,claude-sonnet-5-5
+16-merge-002	191	0.2779	8	claude-opus-5-5
+17-merge-002-auto	11	0.3704	3	claude-haiku-4-5-20251001,claude-opus-5-5
+18-merge-002-auto	14	0.1924	2	claude-haiku-4-5-20251001,claude-opus-5-5
+19-acceptance-002	50	0.4863	18	claude-opus-5-5
