@@ -78,7 +78,8 @@ def status_counts():
     """Number of orders per current status, keyed by label (raw code when unlabelled).
 
     Every label is present, with 0 when no order has it, in STATUS_LABELS order;
-    unlabelled codes follow. Only status keys and int counts are returned, built
+    unlabelled codes follow, strings first in sorted order, then other values
+    (None, numbers) by their text, so mixed types never raise. Only status keys and int counts are returned, built
     fresh on each call, so editing the result never changes stored orders.
     """
     counts = {label: 0 for label in STATUS_LABELS.values()}
@@ -86,7 +87,8 @@ def status_counts():
     for key in list(tally):
         if key in counts:
             counts[key] = tally.pop(key)
-    counts.update(tally)
+    for key in sorted(tally, key=lambda k: (not isinstance(k, str), str(k))):
+        counts[key] = tally[key]
     return counts
 
 
