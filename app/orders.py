@@ -1,5 +1,8 @@
 """Order status lookup for customers (sample domain, in-memory data)."""
 
+from datetime import datetime, timezone
+from typing import NamedTuple
+
 STATUS_LABELS = {
     "pending": "Awaiting payment",
     "paid": "Paid",
@@ -17,8 +20,42 @@ _ORDERS = {
 }
 
 
+class StatusUpdate(NamedTuple):
+    """One recorded status change; immutable once stored."""
+
+    order_id: str
+    status: str
+    at: datetime  # aware, normalized to UTC
+
+
+# Append-only, in record order, keyed by order id; lives for the process lifetime.
+_HISTORY = {}
+
+
 class OrderNotFound(LookupError):
     """Raised when an order does not exist or does not belong to the customer."""
+
+
+def set_status(order_id, status, at=None):
+    """Change an order's status and record the update; the only writer of status.
+
+    Returns False when the status is already current (nothing recorded).
+    Validation happens before any write, so a rejected call stores nothing.
+    """
+    order = _ORDERS.get(order_id)
+    if order is None:
+        raise OrderNotFound("Order not found")
+    if at is None:
+        at = datetime.now(timezone.utc)
+    elif at.tzinfo is None or at.utcoffset() is None:
+        raise ValueError("at must be timezone-aware")
+    if status == order["status"]:
+        return False
+    _ORDERS[order_id] = {**order, "status": status}
+    _HISTORY.setdefault(order_id, []).append(
+        StatusUpdate(order_id, status, at.astimezone(timezone.utc))
+    )
+    return True
 
 
 def get_order(order_id):
