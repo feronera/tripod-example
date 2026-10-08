@@ -68,6 +68,5 @@ Each of these is tracked as a fix in Tripod.
 
 1. **A stale failed check can keep a pull request blocked.**
    - CI runs on `pull_request` and again on `pull_request_review`. The run from before the approval fails and stays failed, so GitHub keeps blocking the merge even after the run triggered by the approval passes.
-   - In this run, re-running the first check unblocked it.
-2. **The repository owner can bypass the rules with `gh pr merge --admin`,** because branch protection did not include administrators.
-3. **Branch protection needs a public repository or a paid GitHub plan.** On a free plan, `scripts/setup-github.sh` fails for private repositories with HTTP 403. This example is public for that reason.
+   - In this run, re-running the first check unblocked it. Tripod 0.5.2 now re-runs it automatically after an approval; [PR #3](https://github.com/feronera/tripod-example/pull/3) tested that fix here.
+2. **Branch protection needs a public repository or a paid GitHub plan.** On a free plan, `scripts/setup-github.sh` fails for private repositories with HTTP 403. This example is public for that reason.
