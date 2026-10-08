@@ -202,6 +202,27 @@ class RouteTest(ServerTestCase):
             "/sign-in?return=/orders/A%3Cscript%3E%22",
         )
 
+    def test_e5_unparseable_request_target_gets_the_not_found_page(self):
+        # urlsplit raises ValueError on this target; review 003 Major 1
+        page = self.get("http://[/orders/A1001")
+        self.assertEqual(page.status, 404)
+        self.assertEqual(self.title(page), "Order not found")
+        self.assertEqual(self.h1(page), ["Order not found"])
+        self.assertEqual(self.banners(page), [BANNER])
+        self.assertNotIn("Location", dict(page.headers))
+        self.assertEqual(page, self.get("/content/orders/A9999"))
+
+    def test_r11_e19_signed_out_sign_in_path_is_not_found_not_a_redirect(self):
+        # /sign-in used to redirect to /sign-in?return=/, which redirected to itself; review 003 Major 1
+        calls = Calls()
+        page = self.signed_out("/sign-in?return=/orders/A1001", load=calls.load)
+        self.assertEqual(page.status, 404)
+        self.assertEqual(self.title(page), "Order not found")
+        self.assertEqual(self.h1(page), ["Order not found"])
+        self.assertEqual(self.banners(page), [])
+        self.assertNotIn("Location", dict(page.headers))
+        self.assertEqual(calls.calls, [])
+
     def test_e19_session_expired_before_try_again(self):
         session = {"customer": "C001"}
         identify = lambda: session["customer"]  # noqa: E731
