@@ -24,3 +24,6 @@ code_dirs: app             # code folders, space separated (used by python test-
 tests_dir: tests           # test folder (protect-tests hook and the no-deleted-test-lines rule)
 strength: python           # python | off | cmd
 strength_cmd:              # for strength: cmd, a command that exits 1 when it finds a weak test
+
+# hx-natthawat holds SuperBiz and escalation on GitHub (docs/scaling.md)
+bootstrap: on

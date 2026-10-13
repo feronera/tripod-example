@@ -11,13 +11,16 @@ Used as a library and as a CLI:
     python3 scripts/lib.py mark-revert <change-dir> "<reason>"
     python3 scripts/lib.py test
 """
+import collections
 import hashlib
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,7 +35,14 @@ LABEL = {"superbiz": "SuperBiz", "superdev": "SuperDev", "escalation": "escalati
 ESCALATION_GATES = (2, 4)
 AUTO_BY = "auto-merge"
 INT_KEYS = {"wip_limit": 2, "auto_merge_max_lines": 200, "auto_merge_min_track": 10,
-            "acceptance_hours": 48}
+            "acceptance_hours": 48, "agent_sign_timeout": 600}
+MODES = ("pod", "autonomous")
+AGENT_PREFIX = "agent:"  # gates.log `by=agent:<leg>`: a signature by an agent seat (docs/autonomous.md)
+# Files that steer agents or define the gates and risk rules. A change that edits them is never signed by agents
+# and never auto-merged, so it cannot weaken its own checks (change 002 review).
+GOVERNANCE_FILES = ("AGENTS.md", "CLAUDE.md", ".claude/", ".mcp.json", "docs/gates.md", "docs/risk-paths",
+                    "docs/model-prices")
+AUTONOMOUS_KEYS = ("superbiz_agent_model", "superdev_agent_model", "sponsor_name", "sponsor_email", "sponsor_github")
 # stack keys of pod.yml (defaults keep the Python sample app behavior)
 STACK_DEFAULTS = {"test_cmd": "python3 -m unittest discover -s tests -t . -v",
                   "code_dirs": "app", "tests_dir": "tests", "strength": "python",
@@ -60,20 +70,125 @@ def read_pod_yml(root=ROOT, missing_ok=False):
             continue
         key, value = line.split(":", 1)
         cfg[key.strip()] = value.strip().strip('"').strip("'")
+    # Role keys may hold comma-separated lists, aligned by position (see members()).
     for key in ("superbiz_email", "superdev_email", "escalation_email",
                 "superbiz_github", "superdev_github", "escalation_github"):
-        cfg[key] = cfg.get(key, "").lower().lstrip("@")
+        cfg[key] = ", ".join(v.lower().lstrip("@") for v in split_list(cfg.get(key, "")))
+    for key in ("superbiz_name", "superdev_name", "escalation_name"):
+        cfg[key] = ", ".join(split_list(cfg.get(key, "")))
+    cfg["base_branch"] = cfg.get("base_branch", "") or "main"
     for key, default in INT_KEYS.items():
         try:
             cfg[key] = int(cfg.get(key, "") or default)
         except ValueError:
             cfg[key] = default
     cfg["auto_merge"] = cfg.get("auto_merge", "off").lower() or "off"
+    cfg["bootstrap"] = cfg.get("bootstrap", "off").lower() or "off"
+    cfg["mode"] = cfg.get("mode", "pod").lower() or "pod"
     for key, default in STACK_DEFAULTS.items():
         cfg[key] = cfg.get(key, "") or default
     cfg["tests_dir"] = cfg["tests_dir"].strip("/") or STACK_DEFAULTS["tests_dir"]
     cfg["strength"] = cfg["strength"].lower()
     return cfg
+
+
+def split_list(value):
+    """Comma-separated pod.yml value as a list of non-empty, stripped items."""
+    return [v.strip() for v in (value or "").split(",") if v.strip()]
+
+
+def members(cfg, role):
+    """People in a role ("superbiz", "superdev" or "escalation") as a list of
+    {name, email, github}. The name, email and github lists are aligned by position;
+    a missing position is an empty string (pod_config_problems reports the mismatch)."""
+    lists = {f: split_list(cfg.get("%s_%s" % (role, f), "")) for f in ("name", "email", "github")}
+    count = max(len(v) for v in lists.values())
+    return [{f: (lists[f][i] if i < len(lists[f]) else "") for f in lists} for i in range(count)]
+
+
+def role_emails(cfg, role):
+    return [m["email"] for m in members(cfg, role) if m["email"]]
+
+
+def role_logins(cfg, role):
+    return [m["github"] for m in members(cfg, role) if m["github"]]
+
+
+def roles_of_email(cfg, email):
+    """Every role whose email list contains `email` (case-insensitive)."""
+    email = (email or "").lower()
+    return [r for r in ("superbiz", "superdev", "escalation") if email and email in role_emails(cfg, r)]
+
+
+def bootstrap_on(cfg):
+    """Bootstrap mode: a pod with fewer people than roles lets escalation share a person with one other
+    role. SuperBiz and SuperDev must still be different people (docs/scaling.md)."""
+    return cfg.get("bootstrap", "off") in ("on", "true", "yes")
+
+
+def acting_roles(cfg, email):
+    """roles_of_email without the escalation seat that bootstrap mode lets a person hold on the side."""
+    roles = roles_of_email(cfg, email)
+    if bootstrap_on(cfg) and len(roles) == 2 and "escalation" in roles:
+        return [r for r in roles if r != "escalation"]
+    return roles
+
+
+BOOTSTRAP_WARNING = ("bootstrap: on. %s also holds escalation, so Risk: high changes get no independent "
+                     "escalation check. Turn bootstrap off when a third person joins (docs/scaling.md).")
+BOOTSTRAP_UNUSED = "bootstrap: on, but nobody holds two roles. Set bootstrap: off"
+
+SCALING_WARNING = ("SuperBiz owns or cross-checks every gate; with more than 3 SuperDevs per SuperBiz, "
+                   "changes will queue at SuperBiz. Add a SuperBiz or split into two pods (docs/scaling.md).")
+
+
+def pod_config_problems(cfg):
+    """(errors, warnings) for the people in pod.yml."""
+    errors, warnings, shared = [], [], set()
+    for field in ("email", "github"):
+        seen = {}
+        for role in ("superbiz", "superdev", "escalation"):
+            for value in {m[field] for m in members(cfg, role) if m[field]}:
+                seen.setdefault(value, []).append(LABEL[role])
+        for value, roles in sorted(seen.items()):
+            if bootstrap_on(cfg) and len(roles) == 2 and "escalation" in roles:
+                shared.add(value)
+                if field == "email":
+                    warnings.append(BOOTSTRAP_WARNING % value)
+                continue
+            if len(roles) > 1:
+                errors.append("pod.yml: %s %s appears in more than one role (%s). One person holds one role"
+                              % ("email" if field == "email" else "GitHub login", value, ", ".join(roles)))
+    for role in ("superbiz", "superdev", "escalation"):
+        counts = {f: len(split_list(cfg.get("%s_%s" % (role, f), ""))) for f in ("name", "email", "github")}
+        size = max(counts.values())
+        if size > 1:
+            bad = [f for f, n in counts.items() if n != size and not (f == "github" and n == 0)]
+            if bad:
+                errors.append("pod.yml: the %s lists have different lengths (%s). Give one value per person, "
+                              "in the same order" % (LABEL[role], ", ".join(
+                                  "%s_%s: %d" % (role, f, n) for f, n in counts.items())))
+    if bootstrap_on(cfg) and not shared:
+        warnings.append(BOOTSTRAP_UNUSED)
+    if cfg.get("mode", "pod") not in MODES:
+        errors.append("pod.yml: mode: %s is not known (use pod or autonomous)" % cfg["mode"])
+    for role in ("superbiz", "superdev", "escalation"):
+        for m in members(cfg, role):
+            if m["email"].startswith(AGENT_PREFIX) or m["github"].startswith(AGENT_PREFIX):
+                errors.append("pod.yml: %s %s starts with `agent:`, which is reserved for agent seats"
+                              % (LABEL[role], m["email"] or m["github"]))
+    if cfg.get("mode") == "autonomous":
+        for key in AUTONOMOUS_KEYS:
+            if not cfg.get(key):
+                errors.append("pod.yml: mode: autonomous needs %s" % key)
+        biz_model, dev_model = cfg.get("superbiz_agent_model"), cfg.get("superdev_agent_model")
+        if biz_model and biz_model == dev_model:
+            errors.append("pod.yml: superbiz_agent_model and superdev_agent_model are both %s; "
+                          "the cross-check must run on a different model" % biz_model)
+    bizs, devs = len(role_emails(cfg, "superbiz")), len(role_emails(cfg, "superdev"))
+    if bizs and devs > 3 * bizs:
+        warnings.append(SCALING_WARNING)
+    return errors, warnings
 
 
 def code_dirs(cfg):
@@ -114,9 +229,30 @@ def blob_hash(path):
 def read_log(change_dir):
     """Return gates.log entries as a list of dicts, in file order."""
     path = os.path.join(change_dir, "gates.log")
-    entries = []
     if not os.path.exists(path):
-        return entries
+        return []
+    with open(path, encoding="utf-8") as fh:
+        return parse_log(fh.read())
+
+
+def parse_log(text):
+    entries = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            parts = line.split()
+        entry = dict(part.split("=", 1) for part in parts if "=" in part)
+        try:
+            entry["gate"] = int(entry.get("gate", "0"))
+        except ValueError:
+            entry["gate"] = 0
+        entry["by"] = entry.get("by", "").lower()
+        entries.append(entry)
+    return entries
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -227,8 +363,9 @@ def value_problem(value):
     return None
 
 
-def check_plan(path):
-    """Problems with the plan.md structure the checker relies on (empty = OK)."""
+def check_plan(path, cfg=None):
+    """Problems with the plan.md structure the checker relies on (empty = OK).
+    With cfg, a part's `owner:` must be a SuperDev in pod.yml."""
     with open(path, encoding="utf-8") as fh:
         sections = md_sections(fh.read())
     problems = []
@@ -259,12 +396,12 @@ def check_plan(path):
         problems.append(pre + "has no `## Parallel parts` heading "
                         "(if the work is not split, write `none: <reason>`)")
     else:
-        problems.extend(pre + p for p in check_parallel_parts(sections["Parallel parts"]))
+        problems.extend(pre + p for p in check_parallel_parts(sections["Parallel parts"], cfg))
     return problems
 
 
-def check_parallel_parts(lines):
-    parts, order, none_reason = {}, [], None
+def check_parallel_parts(lines, cfg=None):
+    parts, tests, owners, order, none_reason = {}, {}, {}, [], None
     current = None
     for raw in lines:
         line = raw.strip()
@@ -281,6 +418,13 @@ def check_parallel_parts(lines):
         if fm and current is not None:
             parts[current] = [f.strip().strip("`").strip() for f in fm.group(1).split(",")]
             parts[current] = [f for f in parts[current] if f]
+        tm = re.match(r"^tests\s*:(.*)$", bare, re.I)
+        if tm and current is not None:
+            tests[current] = [f.strip().strip("`").strip() for f in tm.group(1).split(",")]
+            tests[current] = [f for f in tests[current] if f]
+        om = re.match(r"^owner\s*:(.*)$", bare, re.I)
+        if om and current is not None:
+            owners[current] = om.group(1).strip().strip("`").strip().lower()
     if not order:
         if none_reason is None:
             return ["`## Parallel parts` needs a `none: <reason>` line "
@@ -304,7 +448,213 @@ def check_parallel_parts(lines):
     if overlap:
         problems.append("Parallel parts share files: %s (each part must edit separate files)"
                         % ", ".join("%s (%s)" % (f, ", ".join(owner[f])) for f in overlap))
+    # Each part needs its own tests, so it can go green without waiting for another part.
+    test_owner = {}
+    for name in order:
+        files = tests.get(name)
+        if not files or any("<" in f for f in files):
+            problems.append("part `### %s` has no `tests:` line listing its own test files "
+                            "(each part must be testable on its own)" % name)
+            continue
+        for f in files:
+            test_owner.setdefault(f, []).append(name)
+            if f in owner and name not in owner[f]:
+                problems.append("part `### %s` lists %s under tests:, but part %s edits it"
+                                % (name, f, ", ".join(owner[f])))
+    shared = sorted(f for f, names in test_owner.items() if len(set(names)) > 1)
+    if shared:
+        problems.append("Parallel parts share test files: %s (give each part its own test files)"
+                        % ", ".join("%s (%s)" % (f, ", ".join(test_owner[f])) for f in shared))
+    if cfg is not None:
+        devs = role_emails(cfg, "superdev")
+        for name in order:
+            who = owners.get(name)
+            if who is not None and who not in devs:
+                problems.append("part `### %s` has owner: %s, who is not a SuperDev in pod.yml (superdev_email: %s)"
+                                % (name, who or "-", ", ".join(devs) or "-"))
     return problems
+
+
+def parallel_parts(plan_path):
+    """{part: (files, tests)} from plan.md, or {} when the work is not split."""
+    with open(plan_path, encoding="utf-8") as fh:
+        lines = md_sections(fh.read()).get("Parallel parts", [])
+    result, current = {}, None
+    for raw in lines:
+        line = raw.strip()
+        m = re.match(r"^###\s+(.+?)\s*$", line)
+        if m:
+            current = m.group(1)
+            result[current] = ([], [])
+            continue
+        bare = line.lstrip("-* ").strip("`").strip()
+        for i, key in enumerate(("files", "tests")):
+            km = re.match(r"^%s\s*:(.*)$" % key, bare, re.I)
+            if km and current is not None:
+                result[current][i].extend(f.strip().strip("`").strip()
+                                          for f in km.group(1).split(",") if f.strip())
+    return result
+
+
+def part_owners(plan_path):
+    """{part: owner email} for parts of plan.md that have an `owner:` line."""
+    with open(plan_path, encoding="utf-8") as fh:
+        lines = md_sections(fh.read()).get("Parallel parts", [])
+    owners, current = {}, None
+    for raw in lines:
+        line = raw.strip()
+        m = re.match(r"^###\s+(.+?)\s*$", line)
+        if m:
+            current = m.group(1)
+            continue
+        bare = line.lstrip("-* ").strip("`").strip()
+        om = re.match(r"^owner\s*:(.*)$", bare, re.I)
+        if om and current is not None and om.group(1).strip():
+            owners[current] = om.group(1).strip().strip("`").strip().lower()
+    return owners
+
+
+def part_label(name, owners):
+    return "%s (owner: %s)" % (name, owners[name]) if name in owners else name
+
+
+def python_imports(path):
+    """Dotted module names a Python file imports, including `from pkg import name` as pkg.name."""
+    import ast
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read(), path)
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names.add(node.module)
+            names.update("%s.%s" % (node.module, a.name) for a in node.names)
+    return names
+
+
+def git_out(args, cwd):
+    res = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True, check=False)
+    return res.returncode, res.stdout.strip(), res.stderr.strip()
+
+
+def run_parallel_isolated(change_dir, parts, base, owners=None):
+    """After the build: run each part's tests in a throwaway worktree where every other part's files
+    are put back to how they are at `base`. A part that fails there depends on another part."""
+    import tempfile
+    owners = owners or {}
+    rc, merge_base, err = git_out(["merge-base", "HEAD", base], ROOT)
+    if rc != 0:
+        print("cannot find the merge base of HEAD and %s: %s" % (base, err), file=sys.stderr)
+        return 2
+    results, notes = {}, []
+    for name, (_, tests) in parts.items():
+        py = [t for t in tests if t.endswith(".py")]
+        notes.extend("%s: %s is not Python, so it was not run" % (name, t) for t in tests if not t.endswith(".py"))
+        if not py:
+            continue
+        tmp = tempfile.mkdtemp(prefix="pod-parallel-")
+        wt = os.path.join(tmp, "wt")
+        rc, _, err = git_out(["worktree", "add", "--detach", "-q", wt, "HEAD"], ROOT)
+        if rc != 0:
+            print("cannot create a worktree: %s" % err, file=sys.stderr)
+            return 2
+        try:
+            for other, (files, _) in parts.items():
+                if other == name:
+                    continue
+                for f in files:
+                    in_base = git_out(["cat-file", "-e", "%s:%s" % (merge_base, f)], wt)[0] == 0
+                    if in_base:
+                        git_out(["checkout", merge_base, "--", f], wt)
+                    elif os.path.exists(os.path.join(wt, f)):
+                        os.remove(os.path.join(wt, f))
+            modules = [t[:-3].replace("/", ".") for t in py]
+            res = subprocess.run([sys.executable, "-m", "unittest"] + modules, cwd=wt,
+                                 capture_output=True, text=True, check=False)
+            summary = [l for l in res.stderr.splitlines() if l.startswith(("Ran ", "OK", "FAILED"))]
+            results[name] = (res.returncode == 0, " ".join(summary[-2:]))
+        finally:
+            git_out(["worktree", "remove", "--force", wt], ROOT)
+            shutil.rmtree(tmp, ignore_errors=True)
+    for n in notes:
+        print("note: " + n)
+    failed = [n for n, (ok, _) in results.items() if not ok]
+    for name, (ok, summary) in results.items():
+        print("%s %s: tests without the other parts' code: %s"
+              % ("PASS" if ok else "FAIL", part_label(name, owners), summary))
+    if failed:
+        print("The parts were not independent: %s needs code from another part. Merge the part it needs first, "
+              "and next time build that interface first as a Blocking first step." % ", ".join(failed))
+        return 1
+    print("OK: every part's tests pass without the other parts' code")
+    return 0
+
+
+def cmd_parallel_check(args):
+    run, base = False, "main"
+    rest = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--run":
+            run = True
+        elif args[i] == "--base" and i + 1 < len(args):
+            base = args[i + 1]
+            i += 1
+        else:
+            rest.append(args[i])
+        i += 1
+    args = rest
+    if len(args) != 1:
+        print("usage: scripts/parallel-check.sh <change-dir> [--run [--base <ref>]]", file=sys.stderr)
+        return 2
+    change_dir = os.path.abspath(args[0])
+    plan = os.path.join(change_dir, "plan.md")
+    if not os.path.exists(plan):
+        print("plan.md not found in %s" % args[0], file=sys.stderr)
+        return 1
+    parts = parallel_parts(plan)
+    owners = part_owners(plan)
+    if not parts:
+        print("OK: plan.md does not split the work into parallel parts")
+        return 0
+    module_owner = {}
+    for name, (files, _) in parts.items():
+        for f in files:
+            if f.endswith(".py"):
+                module_owner[f[:-3].replace("/", ".")] = name
+    problems, skipped = [], []
+    for name, (_, tests) in parts.items():
+        if not tests:
+            problems.append("part %s lists no tests" % part_label(name, owners))
+        for t in tests:
+            path = os.path.join(ROOT, t)
+            if not os.path.exists(path):
+                problems.append("part %s: %s does not exist yet (write the tests before splitting)"
+                                % (part_label(name, owners), t))
+                continue
+            if not t.endswith(".py"):
+                skipped.append(t)
+                continue
+            for mod in sorted(python_imports(path)):
+                other = module_owner.get(mod)
+                if other and other != name:
+                    problems.append("part %s: %s imports %s, which part %s builds. These tests cannot pass "
+                                    "until part %s is merged. Move the shared interface into a Blocking first "
+                                    "step, or test part %s through its own files only"
+                                    % (part_label(name, owners), t, mod, other, other, name))
+    for t in skipped:
+        print("note: %s is not Python, so its imports were not checked" % t)
+    if problems:
+        print("FAIL: the parallel parts are not independent")
+        for p in problems:
+            print("  - " + p)
+        return 1
+    print("OK: each part's tests import only its own files (%s)"
+          % ", ".join(part_label(n, owners) for n in parts))
+    if run:
+        return run_parallel_isolated(change_dir, parts, base, owners)
+    return 0
 
 
 def git_email(root=ROOT):
@@ -317,19 +667,12 @@ def git_email(root=ROOT):
 
 
 def role_for(cfg, gate, email):
-    """Return 'owner', 'cross', 'escalation' or None."""
+    """Return 'owner', 'cross', 'escalation' or None. Any member of a role acts for that role."""
     owner, cross = OWNERS[gate]
-    if not email:
-        return None
-    if cfg["superbiz_email"] == cfg["superdev_email"]:
-        return None  # misconfigured pod: one person cannot hold both seats
-    if email == cfg[owner + "_email"]:
-        return "owner"
-    if email == cfg[cross + "_email"]:
-        return "cross"
-    if email == cfg["escalation_email"]:
-        return "escalation"
-    return None
+    roles = acting_roles(cfg, email)
+    if len(roles) != 1:
+        return None  # unknown, or misconfigured pod: one person cannot hold two roles
+    return {owner: "owner", cross: "cross", "escalation": "escalation"}[roles[0]]
 
 
 def required_roles(gate, risk):
@@ -359,10 +702,205 @@ def reverts(entries):
     return [e for e in entries if e.get("event") == "revert"]
 
 
-def expected_email(cfg, gate, role):
+def expected_emails(cfg, gate, role):
+    """Emails that may sign `role` at `gate` (every member of the required pod role)."""
     owner, cross = OWNERS[gate]
-    return {"owner": cfg[owner + "_email"], "cross": cfg[cross + "_email"],
-            "escalation": cfg["escalation_email"]}[role]
+    return role_emails(cfg, {"owner": owner, "cross": cross, "escalation": "escalation"}[role])
+
+
+def resolve_base(base, root=ROOT):
+    """origin/<base> when that ref exists, else <base>."""
+    if not base.startswith("origin/") and git_out(["rev-parse", "--verify", "--quiet",
+                                                   "origin/%s^{commit}" % base], root)[0] == 0:
+        return "origin/" + base
+    return base
+
+
+def code_authors(ref, root=ROOT):
+    """Author emails of the code commits in merge-base(HEAD, ref)..HEAD. A code commit touches at least
+    one file outside docs/. Returns (set of emails, None), or (None, note) when there is nothing to check."""
+    rc, merge_base, _ = git_out(["merge-base", "HEAD", ref], root)
+    if rc != 0 or not merge_base:
+        return None, "peer review skipped: no merge base between HEAD and %s" % ref
+    rc, out, err = git_out(["log", "--no-merges", "--format=%x00%ae", "--name-only",
+                            "%s..HEAD" % merge_base], root)
+    if rc != 0:
+        return None, "peer review skipped: cannot read the commits since %s (%s)" % (ref, err)
+    authors = set()
+    for chunk in out.split("\0")[1:]:
+        lines = [l.strip() for l in chunk.strip().splitlines() if l.strip()]
+        if lines and any(not f.startswith("docs/") for f in lines[1:]):
+            authors.add(lines[0].lower())
+    if not authors:
+        return None, "peer review skipped: no code commits (outside docs/) between %s and HEAD" % ref
+    return authors, None
+
+
+def peer_review_problem(cfg, email, root=ROOT):
+    """(refusal or None, note or None) for the gate 4 owner signature.
+    With 2 or more SuperDevs, the SuperDev who signs gate 4 as owner must not have written code in the change.
+    When every SuperDev wrote code, the rule falls back to the SuperBiz cross-check (as with one SuperDev)."""
+    devs = role_emails(cfg, "superdev")
+    if len(devs) < 2:
+        return None, None
+    ref = resolve_base(cfg["base_branch"], root)
+    authors, note = code_authors(ref, root)
+    if authors is None:
+        return None, note
+    free = [d for d in devs if d not in authors]
+    if email not in authors:
+        return None, None
+    if not free:
+        return None, ("peer review falls back: every SuperDev wrote code in this change (%s), so the SuperBiz "
+                      "cross-check is the second pair of eyes (docs/scaling.md)" % ", ".join(sorted(authors)))
+    return ("Refused: peer review. With 2 or more SuperDevs, the gate 4 owner must not have written code in "
+            "this change. Code commits since %s were authored by: %s. Ask another SuperDev to sign gate 4: %s"
+            % (ref, ", ".join(sorted(authors)), ", ".join(free))), None
+
+
+SECRET_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "PRIVATE_KEY", "CREDENTIAL")
+
+
+def agent_env(extra=None):
+    """The environment for an agent session: no access tokens, secrets or cloud keys. ANTHROPIC_* stays, so
+    claude can sign in."""
+    env = {}
+    for k, v in os.environ.items():
+        key = k.upper()
+        if key.startswith("ANTHROPIC_"):
+            env[k] = v
+        elif any(m in key for m in SECRET_MARKERS) or key.endswith("_API_KEY") or key.startswith(("AWS_", "GH_",
+                                                                                                    "GITHUB_")) \
+                or key in ("SSH_AUTH_SOCK", "NPM_TOKEN"):
+            continue
+        else:
+            env[k] = v
+    env.update(extra or {})
+    return env
+
+
+def governance_files(files):
+    return [f for f in files if any(f == g or (g.endswith("/") and f.startswith(g)) for g in GOVERNANCE_FILES)]
+
+
+def is_agent(entry):
+    return entry.get("by", "").startswith(AGENT_PREFIX)
+
+
+def mode_record_on_base(change_dir, cfg, root=ROOT):
+    """The `event=mode` record of this change as it is on the base branch, or None.
+    Only a record that is already on the base branch (a finished, merged change) can outlive a switch back to
+    `mode: pod`; a record written on a branch cannot turn Autonomous mode on by itself."""
+    rel = os.path.relpath(os.path.join(change_dir, "gates.log"), root)
+    rc, text, _ = git_out(["show", "%s:%s" % (resolve_base(cfg["base_branch"], root), rel)], root)
+    if rc != 0:
+        return None
+    for line in text.splitlines():
+        if line.startswith("event=mode "):
+            try:
+                return dict(p.split("=", 1) for p in shlex.split(line) if "=" in p)
+            except ValueError:
+                return None
+    return None
+
+
+def ci_base_ref():
+    """The pull request's base branch as GitHub reports it, which the pull request cannot change: the event
+    payload (pull_request and pull_request_review events), else GITHUB_BASE_REF. Empty outside CI."""
+    try:
+        with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as fh:
+            ref = json.load(fh).get("pull_request", {}).get("base", {}).get("ref")
+        if ref:
+            return ref
+    except (KeyError, OSError, ValueError, AttributeError):
+        pass
+    return os.environ.get("GITHUB_BASE_REF", "")
+
+
+def plan_merged_as_is(change_dir, cfg, roles, blob, root=ROOT):
+    """True when the base branch already holds this plan.md (same blob) and, for every role, its latest gate 3
+    signature for that blob. Such a plan passed CI when it merged, so plan rules added by a later kit do not fail
+    it (change 007). Anything only on a branch or in the working tree is still checked."""
+    name = cfg["base_branch"]
+    if name.startswith("change/") or (ci_base_ref() or name) != name:
+        return False  # a change cannot name its own branch as the base (CI knows the real one)
+    base = resolve_base(name, root)
+    folder = os.path.relpath(change_dir, root)
+    try:
+        plan = subprocess.run(["git", "show", "%s:%s/plan.md" % (base, folder)], cwd=root, capture_output=True)
+        log = subprocess.run(["git", "show", "%s:%s/gates.log" % (base, folder)], cwd=root, capture_output=True)
+    except OSError:
+        return False
+    if plan.returncode != 0 or log.returncode != 0:
+        return False
+    if hashlib.sha1(b"blob %d\0" % len(plan.stdout) + plan.stdout).hexdigest() != blob:
+        return False
+    latest = {e["role"]: e.get("blob") for e in parse_log(log.stdout.decode("utf-8", "replace"))
+              if e["gate"] == 3 and "role" in e}
+    return all(latest.get(role) == blob for role in roles)
+
+
+def change_mode(entries, cfg, change_dir=None):
+    """Autonomous when pod.yml says so. In `mode: pod`, a change keeps Autonomous mode only when its
+    `event=mode` record is already on the base branch (C2 of change 002), so a line forged on a branch
+    never counts."""
+    if cfg.get("mode") == "autonomous":
+        return "autonomous"
+    if change_dir and any(e.get("event") == "mode" for e in entries):
+        record = mode_record_on_base(change_dir, cfg)
+        if record and record.get("mode") == "autonomous":
+            return "autonomous"
+    return cfg.get("mode", "pod")
+
+
+def change_seats(entries, cfg, change_dir=None):
+    """The seat models to check against: pod.yml's in Autonomous mode, else those recorded on the base branch
+    for a finished change."""
+    if cfg.get("mode") == "autonomous" or not change_dir or not any(e.get("event") == "mode" for e in entries):
+        return {leg: cfg.get("%s_agent_model" % leg, "") for leg in ("superbiz", "superdev")}
+    record = mode_record_on_base(change_dir, cfg) or {}
+    return {leg: record.get("%s_agent_model" % leg, "") for leg in ("superbiz", "superdev")}
+
+
+def agent_usage(change_dir):
+    """{(session, model)} with usage in the change's activity.log: the evidence an agent signature needs."""
+    import activity  # activity imports lib
+    records, _ = activity.read_records(os.path.join(change_dir, "activity.log"))
+    return {(r.get("session"), r.get("model")) for r in records if r.get("event") == "usage" and r.get("session")}
+
+
+def refused_runs(change_dir):
+    """Sessions whose check ended in REFUSE (`event=verdict ... verdict=refuse` in activity.log)."""
+    import activity
+    records, _ = activity.read_records(os.path.join(change_dir, "activity.log"))
+    return {r.get("run") for r in records if r.get("event") == "verdict" and r.get("verdict") != "approve"}
+
+
+def agent_signature_problem(seats, gate, role, entry, risk, mode, usage):
+    """None when an agent signature is acceptable, else the problem (rules in a fixed order)."""
+    by = entry.get("by", "")
+    leg = by[len(AGENT_PREFIX):]
+    if mode != "autonomous":
+        return "gate %d: agent signature not allowed here (mode: %s)" % (gate, mode)
+    if risk != "low":
+        return "gate %d: agent signature not allowed here (Risk: %s)" % (gate, risk)
+    if gate == 1:
+        return "gate %d: agent signature not allowed here (gate 1 is signed by people)" % gate
+    if not entry.get("session") or not entry.get("model"):
+        return "gate %d: agent signature by %s has no %s, so it cannot be traced" % (
+            gate, by, "session" if not entry.get("session") else "model")
+    owner, cross = OWNERS[gate]
+    need = {"owner": owner, "cross": cross}.get(role)
+    if leg != need:
+        return "gate %d: %s must be signed by agent:%s, not %s" % (gate, role, need or "-", by)
+    expected = seats.get(leg, "")
+    if entry.get("model") != expected:
+        return ("gate %d: agent signature by %s used %s, but pod.yml sets %s_agent_model: %s"
+                % (gate, by, entry.get("model") or "-", leg, expected or "-"))
+    if (entry.get("session"), entry.get("model")) not in usage:
+        return ("gate %d: agent signature by %s has no usage for session %s with %s in activity.log"
+                % (gate, by, (entry.get("session") or "-")[:8], entry.get("model")))
+    return None
 
 
 def role_label(gate, role):
@@ -388,9 +926,12 @@ def check_gate(change_dir, gate, cfg, entries=None, risk=None, release=False):
     current = blob_hash(artifact) if os.path.exists(artifact) else None
     if current is None:
         problems.append("gate %d: %s not found (artifact missing)" % (gate, ARTIFACTS[gate]))
-    elif gate == 3:
-        problems.extend(check_plan(artifact))
+    elif gate == 3 and not plan_merged_as_is(change_dir, cfg, roles, current):
+        problems.extend(check_plan(artifact, cfg))
     indexed = [(i, e) for i, e in enumerate(entries) if e["gate"] == gate]
+    mode, usage = change_mode(entries, cfg, change_dir), None
+    seats = change_seats(entries, cfg, change_dir)
+    agent_sessions = collections.Counter(e.get("session") for e in entries if is_agent(e) and e.get("session"))
     latest = {}
     for i, e in indexed:
         latest[e.get("role", "")] = (i, e)
@@ -402,10 +943,24 @@ def check_gate(change_dir, gate, cfg, entries=None, risk=None, release=False):
                             % (gate, role_label(gate, role), extra, role))
             continue
         idx, e = latest[role]
-        want = expected_email(cfg, gate, role)
-        if e["by"] != want:
-            problems.append("gate %d: %s signed by %s, which does not match pod.yml (%s) (role mismatch)"
-                            % (gate, role, e["by"], want or "-"))
+        if is_agent(e):
+            usage = agent_usage(change_dir) if usage is None else usage
+            problem = agent_signature_problem(seats, gate, role, e, risk, mode, usage)
+            if not problem and agent_sessions[e["session"]] > 1:
+                problem = ("gate %d: session %s backs more than one agent signature; each check is one run"
+                           % (gate, e["session"][:8]))
+            if not problem and e["session"] in refused_runs(change_dir):
+                problem = "gate %d: session %s ended in REFUSE, so it cannot back a signature" % (gate, e["session"][:8])
+            if not problem and gate == 4 and not auto_entry(entries):
+                problem = ("gate 4: agent signature not allowed here (no auto-merge record: agents sign gate 4 "
+                           "only after an auto-merge)")
+            if problem:
+                problems.append(problem)
+        else:
+            want = expected_emails(cfg, gate, role)
+            if e["by"] not in want:
+                problems.append("gate %d: %s signed by %s, which does not match pod.yml (%s) (role mismatch)"
+                                % (gate, role, e["by"], ", ".join(want) or "-"))
         if current is not None and e.get("blob") != current:
             problems.append("gate %d: %s approval is stale because %s changed after approval"
                             % (gate, role, ARTIFACTS[gate]))
@@ -418,16 +973,20 @@ def check_gate(change_dir, gate, cfg, entries=None, risk=None, release=False):
                 problems.append("gate %d: %s must sign after owner (wrong role order)"
                                 % (gate, role))
     if "owner" in latest and "cross" in latest:
+        o, c = latest["owner"][1], latest["cross"][1]
+        if is_agent(o) and is_agent(c) and o.get("model") and o.get("model") == c.get("model"):
+            problems.append("gate %d: owner and cross were both signed by %s; the cross-check must run on a "
+                            "different model" % (gate, o["model"]))
         if latest["owner"][1]["by"] == latest["cross"][1]["by"]:
             problems.append("gate %d: owner and cross are the same person (%s): writer and approver must differ"
                             % (gate, latest["owner"][1]["by"]))
     return problems
 
 
-def log_ignored(change_dir):
-    """True when git would ignore this change's gates.log (e.g. a global *.log rule).
-    Ignored approvals never reach the other person or CI, so the cross-gate silently fails."""
-    path = os.path.join(change_dir, "gates.log")
+def log_ignored(change_dir, name="gates.log"):
+    """True when git would ignore this change's `name` (gates.log by default, or activity.log), e.g. through a
+    global *.log rule. Ignored approvals never reach the other person or CI, so the cross-gate silently fails."""
+    path = os.path.join(change_dir, name)
     try:
         res = subprocess.run(["git", "check-ignore", "-q", path], cwd=ROOT,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -436,6 +995,8 @@ def log_ignored(change_dir):
     return res.returncode == 0
 
 
+ACTIVITY_IGNORED_HINT = ("activity.log is ignored by git (often a global *.log rule), so it would never be shared. "
+                         "Add '!docs/changes/*/activity.log' to .gitignore")
 IGNORED_HINT = ("gates.log is ignored by git (often a global *.log rule), so approvals would never be shared. "
                 "Add '!docs/changes/*/gates.log' to .gitignore")
 
@@ -484,6 +1045,48 @@ def open_changes(cfg, root=ROOT):
             if gate_complete(d, 1, cfg) and not gate_complete(d, 4, cfg)]
 
 
+CHANGE_BRANCH = re.compile(r"^refs/(?:heads|remotes/([^/]+))/change/(\d{3}-[^/]+)$")
+
+
+def known_changes(root, scratch):
+    """Every change this machine knows of, as {name: (where, folder)}: the working tree first, then local
+    `change/NNN-slug` branches, then remote-tracking ones as last fetched. A branch's gates.log and intent.md
+    are copied from its tip into `scratch`, without a checkout. folder is None when the branch has no folder."""
+    known = {os.path.basename(d): ("working tree", d) for d in change_dirs(root)}
+    try:
+        out = subprocess.run(["git", "for-each-ref", "--format=%(refname)", "refs/heads/change/", "refs/remotes/"],
+                             cwd=root, capture_output=True, text=True).stdout
+        head = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=root, capture_output=True,
+                              text=True).stdout.strip()
+    except OSError:  # no git: the working tree only, as before
+        out, head = "", ""
+    # the current branch is the working tree, so `git checkout -b change/007-x` then new-change.sh gives 007
+    current = CHANGE_BRANCH.match(head)
+    refs = [(m.group(1), m.group(2), ref) for ref in out.split() for m in [CHANGE_BRANCH.match(ref)]
+            if m and not (current and m.group(2) == current.group(2))]
+    for remote, name, ref in sorted(refs, key=lambda r: r[0] is not None):  # local branches first
+        if name in known:
+            continue
+        where = "branch %schange/%s" % (remote + "/" if remote else "", name)
+        folder = os.path.join(scratch, str(len(known)), name)
+        found = False
+        for fname in ("gates.log", "intent.md"):
+            res = subprocess.run(["git", "show", "%s:docs/changes/%s/%s" % (ref, name, fname)],
+                                 cwd=root, capture_output=True)
+            if res.returncode == 0:
+                os.makedirs(folder, exist_ok=True)
+                with open(os.path.join(folder, fname), "wb") as fh:
+                    fh.write(res.stdout)
+                found = True
+        known[name] = (where, folder if found else None)
+    return known
+
+
+def open_known(cfg, known):
+    return [(name, where) for name, (where, folder) in sorted(known.items())
+            if folder and gate_complete(folder, 1, cfg) and not gate_complete(folder, 4, cfg)]
+
+
 def rel(path):
     return os.path.relpath(os.path.abspath(path), os.getcwd())
 
@@ -507,8 +1110,13 @@ def cmd_gate(args):
     email = git_email()
     role = role_for(cfg, gate, email)
     if role is None:
-        print("Refused: git email '%s' may not sign gate %d according to pod.yml "
-              "(SuperBiz and SuperDev must use different emails)" % (email or "-", gate), file=sys.stderr)
+        held = acting_roles(cfg, email)
+        if len(held) > 1:
+            print("Refused: git email '%s' is listed in more than one role in pod.yml (%s). "
+                  "One person holds one role" % (email, ", ".join(LABEL[r] for r in held)), file=sys.stderr)
+        else:
+            print("Refused: git email '%s' may not sign gate %d according to pod.yml "
+                  "(SuperBiz and SuperDev must use different emails)" % (email or "-", gate), file=sys.stderr)
         return 1
     risk = risk_of(change_dir)
     if role == "escalation" and role not in required_roles(gate, risk):
@@ -524,12 +1132,19 @@ def cmd_gate(args):
                 print("  - " + p, file=sys.stderr)
             return 1
     if gate == 3:
-        plan_problems = check_plan(artifact)
+        plan_problems = check_plan(artifact, cfg)
         if plan_problems:
             print("Refused: plan.md does not follow the required structure, so gate 3 cannot be signed", file=sys.stderr)
             for p in plan_problems:
                 print("  - " + p, file=sys.stderr)
             return 1
+    if gate == 4 and role == "owner":
+        refusal, note = peer_review_problem(cfg, email)
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return 1
+        if note:
+            print("note: " + note)
     blob = blob_hash(artifact)
     if role != "owner":
         owner_ok = any(e["gate"] == gate and e.get("role") == "owner" and e.get("blob") == blob
@@ -543,10 +1158,21 @@ def cmd_gate(args):
     if log_ignored(change_dir):
         print("Refused: " + IGNORED_HINT, file=sys.stderr)
         return 1
-    line = "gate=%d role=%s by=%s at=%s blob=%s\n" % (gate, role, email, now_iso(), blob)
+    if log_ignored(change_dir, "activity.log"):
+        print("Warning: " + ACTIVITY_IGNORED_HINT)
+    lines = ["gate=%d role=%s by=%s at=%s blob=%s\n" % (gate, role, email, now_iso(), blob)]
+    # Bootstrap: the person who also holds escalation signs that seat in the same step, marked as such.
+    also_escalation = (role != "escalation" and bootstrap_on(cfg) and "escalation" in required_roles(gate, risk)
+                       and "escalation" in roles_of_email(cfg, email))
+    if also_escalation:
+        lines.append("gate=%d role=escalation by=%s at=%s blob=%s note=bootstrap\n"
+                     % (gate, email, now_iso(), blob))
     with open(os.path.join(change_dir, "gates.log"), "a", encoding="utf-8") as fh:
-        fh.write(line)
+        fh.writelines(lines)
     print("Recorded: gate %d role=%s by=%s" % (gate, role, email))
+    if also_escalation:
+        print("Recorded: gate %d role=escalation by=%s (bootstrap: the same person holds escalation)"
+              % (gate, email))
     if gate == 4 and not check_gate(change_dir, 4, cfg):
         print("gate 4 is merge-ready (Risk: %s)" % risk)
     missing = check_gate(change_dir, gate, cfg, release=True)
@@ -578,6 +1204,18 @@ def cmd_check(args):
         print("usage: scripts/gate-check.sh <change-dir> [upto] | --all", file=sys.stderr)
         return 2
     failed = False
+    if args == ["--all"]:
+        errors, warnings = pod_config_problems(cfg)
+        import sponsor  # limits for the sponsor's controls (change 003)
+        import loop  # the loop's keys (change 004)
+        errors = errors + sponsor.read_limits(cfg)[1] + loop.read_loop_config(cfg)[1]
+        for w in warnings:
+            print("Warning: " + w)
+        if errors:
+            failed = True
+            print("FAIL pod.yml")
+            for p in errors:
+                print("  - " + p)
     if not dirs:
         print("OK: no changes in docs/changes/ yet")
     for d in dirs:
@@ -604,15 +1242,23 @@ def cmd_new_change(args):
         print("usage: scripts/new-change.sh <slug>   (a-z, 0-9, -)", file=sys.stderr)
         return 2
     cfg = read_pod_yml()
-    current = open_changes(cfg)
+    scratch = tempfile.mkdtemp(prefix="tripod-changes-")
+    try:
+        known = known_changes(ROOT, scratch)
+        current = open_known(cfg, known)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
     if len(current) >= cfg["wip_limit"]:
         print("Refused: %d open changes reach the WIP limit (%d). Take a change through gate 4 first:"
               % (len(current), cfg["wip_limit"]), file=sys.stderr)
-        for d in current:
-            print("  - " + os.path.basename(d), file=sys.stderr)
+        for name, where in current:
+            print("  - %s (%s)" % (name, where), file=sys.stderr)
+        if any(where.startswith("branch ") and where.count("/") > 1 for _, where in current):
+            print("Remote branches are as of the last git fetch.", file=sys.stderr)
+        print("An abandoned change still counts: delete its branch (git branch -d, git push origin --delete) "
+              "to free the slot.", file=sys.stderr)
         return 1
-    numbers = [int(os.path.basename(d)[:3]) for d in change_dirs()]
-    number = max(numbers, default=0) + 1
+    number = max((int(name[:3]) for name in known), default=0) + 1
     target = os.path.join(CHANGES_DIR, "%03d-%s" % (number, args[0]))
     os.makedirs(target)
     shutil.copy(os.path.join(TEMPLATES_DIR, "intent.md"), os.path.join(target, "intent.md"))
@@ -684,6 +1330,11 @@ def cmd_metrics(args):
         print("lead time intent -> gate 4: %s" % fmt_duration((finish - start).total_seconds()))
     else:
         print("lead time intent -> gate 4: gate 4 not complete yet")
+    import activity  # scripts/activity.py imports lib, so import it here, not at the top
+    totals = activity.change_totals(change_dir)
+    print("agent time: %s" % (totals[0] if totals else "no activity.log"))
+    print("agent cost: %s" % (totals[1] if totals else "no activity.log"))
+    print(activity.signatures_line(change_dir, by_model=False))
     return 0
 
 
@@ -748,8 +1399,8 @@ def cmd_mark_revert(args):
         return 1
     cfg = read_pod_yml()
     email = git_email()
-    members = {cfg["superbiz_email"], cfg["superdev_email"], cfg["escalation_email"]} - {""}
-    if email not in members:
+    people = {e for r in ("superbiz", "superdev", "escalation") for e in role_emails(cfg, r)}
+    if email not in people:
         print("Refused: git email '%s' is not a member in pod.yml" % (email or "-"), file=sys.stderr)
         return 1
     reason = " ".join(args[1].replace('"', "'").split())
@@ -777,7 +1428,7 @@ def cmd_test(args):
 
 COMMANDS = {"test": cmd_test, "gate": cmd_gate, "check": cmd_check, "new-change": cmd_new_change,
             "metrics": cmd_metrics, "release-check": cmd_release_check,
-            "mark-revert": cmd_mark_revert}
+            "mark-revert": cmd_mark_revert, "parallel-check": cmd_parallel_check}
 
 
 def main(argv):

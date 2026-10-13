@@ -29,7 +29,7 @@ def head_sha():
 
 
 def changed_files(base, *paths):
-    code, out = git("diff", "--relative", "--name-only", "%s...HEAD" % base, "--", *paths)
+    code, out = git("diff", "--relative", "--no-renames", "--name-only", "%s...HEAD" % base, "--", *paths)
     if code != 0:
         return None
     return [line for line in out.splitlines() if line]
@@ -125,6 +125,22 @@ def auto_merge_reasons(change_dir, base, cfg):
     risky = lib.risky_files(files, ROOT)
     if risky:
         reasons.append("touches a sensitive path: %s. The effective risk tier is high" % ", ".join(risky))
+    governance = lib.governance_files(files)
+    if governance:
+        reasons.append("edits agent instructions or gate rules (%s), so people merge it" % ", ".join(governance))
+    import sponsor  # the sponsor's ceiling (change 003)
+    limits, problems = sponsor.read_limits(cfg)
+    reasons.extend(problems)
+    banned = sponsor.forbidden_files(files, limits)
+    if banned:
+        reasons.append("touches %s, which agents may not change (agent_forbidden_paths); people merge it"
+                       % ", ".join(banned))
+    if limits.merges_per_day is not None:
+        at = sponsor.now()
+        done = sponsor.merges_today(sponsor.ledger(ROOT, at)[0], at, exclude=os.path.basename(change_dir))
+        if done >= limits.merges_per_day:
+            reasons.append("%d changes were auto-merged in the last 24 hours (agent_merges_per_day: %d); "
+                           "people merge this one" % (done, limits.merges_per_day))
     # 4. gates 1-3 complete and fresh
     for p in lib.check_change(change_dir, cfg, 3):
         reasons.append("gates 1-3 not complete: %s" % p)
@@ -281,25 +297,63 @@ def pr_reasons(author, approvals, base, cfg):
                                for r in deny)
     if auto_ok:
         return risk, reasons
-    # The approver is never the PR author. When the agent opens PRs with SuperDev's account,
-    # SuperDev cannot approve, so the other pod member's approval is the cross-check (same idea as cross-gate).
-    logins = {seat: cfg.get(seat + "_github", "") for seat in ("superdev", "superbiz", "escalation")}
-    for seat, login in logins.items():
-        if not login:
+    return risk, reasons + approval_reasons(author, approvals, base, risk, cfg)
+
+
+def who(seat, logins):
+    """`SuperDev (dev-example)` or `SuperDev (one of dan-gh, eve-gh)`."""
+    return "%s (%s%s)" % (lib.LABEL[seat], "one of " if len(logins) > 1 else "", ", ".join(logins))
+
+
+def approval_reasons(author, approvals, base, risk, cfg):
+    """Missing GitHub approvals for the effective risk (no valid auto record).
+
+    Seats are sets: any member of a role may approve for it, but never the PR author. With 2 or more
+    SuperDevs, the SuperDev approval must come from a peer: a SuperDev who is neither the PR author nor
+    the author of a code commit in the change. When no such SuperDev exists (one SuperDev, or every
+    SuperDev wrote code), the rule falls back to the two-person rule: SuperBiz approves when a SuperDev
+    opened the PR (the same idea as the cross-gate)."""
+    reasons = []
+    people = {seat: lib.members(cfg, seat) for seat in ("superdev", "superbiz", "escalation")}
+    for seat, group in people.items():
+        if not [m for m in group if m["github"]]:
             reasons.append("pod.yml has no %s_github" % seat)
-    if reasons and any(r.startswith("pod.yml has no") for r in reasons):
-        return risk, reasons
+    if reasons:
+        return reasons
+    approvals = approvals - {author}  # a PR author never approves their own PR
+    logins = {seat: [m["github"] for m in group if m["github"] and m["github"] != author]
+              for seat, group in people.items()}
+    devs = people["superdev"]
+    peers, code_by = [], set()
+    if len(devs) >= 2:
+        authors, _ = lib.code_authors(base, ROOT)
+        code_by = authors or set()
+        peers = [m["github"] for m in devs
+                 if m["github"] and m["github"] != author and m["email"] not in code_by]
+    author_is_dev = author in [m["github"] for m in devs]
+    peer_note = (" (peer review: a SuperDev who did not open the PR and did not write the code%s)"
+                 % ("; code by " + ", ".join(sorted(code_by)) if code_by else ""))
+
+    def need(seat, allowed, note=""):
+        if allowed and not set(allowed) & approvals:
+            reasons.append("no approval yet from %s, required for Risk: %s%s"
+                           % (who(seat, allowed), risk, note))
+
     if risk in ("low", "medium"):
-        seats = ["superdev"] if logins["superdev"] != author else ["superbiz"]
+        if peers:
+            need("superdev", peers, peer_note)
+        elif not author_is_dev:
+            need("superdev", logins["superdev"])
+        else:
+            need("superbiz", logins["superbiz"], " (SuperDev opened the PR, so SuperBiz must approve instead)")
     else:
-        seats = [s for s in ("superdev", "superbiz", "escalation") if logins[s] != author]
-    for seat in seats:
-        login = logins[seat]
-        if login not in approvals:
-            note = " (SuperDev opened the PR, so SuperBiz must approve instead)" if seat == "superbiz" and risk != "high" else ""
-            reasons.append("no approval yet from %s (%s), required for Risk: %s%s"
-                           % (lib.LABEL[seat], login, risk, note))
-    return risk, reasons
+        if peers:
+            need("superdev", peers, peer_note)
+        else:
+            need("superdev", logins["superdev"])
+        need("superbiz", logins["superbiz"])
+        need("escalation", logins["escalation"])
+    return reasons
 
 
 def cmd_pr_check(args):
@@ -321,6 +375,9 @@ def cmd_pr_check(args):
         author, approvals, base = github_pr_context()
     cfg = lib.read_pod_yml(ROOT)
     risk, reasons = pr_reasons(author, approvals, base, cfg)
+    if lib.bootstrap_on(cfg) and risk == "high":
+        print("note: bootstrap mode, so one approval may count for SuperBiz and escalation when the same "
+              "person holds both (docs/scaling.md)")
     if reasons:
         print("PR-CHECK FAIL (effective Risk: %s)" % risk)
         for r in reasons:
@@ -333,7 +390,10 @@ def cmd_pr_check(args):
 # ---------- CODEOWNERS ----------
 
 def codeowners_text(cfg):
-    owners = " ".join("@" + cfg[k] for k in ("superdev_github", "escalation_github") if cfg.get(k))
+    logins = []
+    for seat in ("superdev", "escalation"):
+        logins += [l for l in lib.role_logins(cfg, seat) if l not in logins]
+    owners = " ".join("@" + l for l in logins)
     lines = ["# Generated by scripts/sync-codeowners.sh from docs/risk-paths. Do not edit by hand.",
              "# Sensitive paths need review from SuperDev and escalation."]
     lines += ["%s %s" % (g, owners) for g in lib.read_risk_paths(ROOT)]
