@@ -8,3 +8,6 @@ __pycache__/
 # approvals must be committed even when a global gitignore ignores *.log
 !docs/changes/*/gates.log
 !examples/**/gates.log
+# pod kit
+!**/skills/build/
+!docs/changes/*/activity.log
