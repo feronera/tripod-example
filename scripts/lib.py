@@ -188,6 +188,9 @@ def pod_config_problems(cfg):
     bizs, devs = len(role_emails(cfg, "superbiz")), len(role_emails(cfg, "superdev"))
     if bizs and devs > 3 * bizs:
         warnings.append(SCALING_WARNING)
+    problem = base_problem(cfg)
+    if problem:
+        errors.append(problem)
     return errors, warnings
 
 
@@ -253,23 +256,6 @@ def parse_log(text):
         entry["by"] = entry.get("by", "").lower()
         entries.append(entry)
     return entries
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            try:
-                parts = shlex.split(line)
-            except ValueError:
-                parts = line.split()
-            entry = dict(part.split("=", 1) for part in parts if "=" in part)
-            try:
-                entry["gate"] = int(entry.get("gate", "0"))
-            except ValueError:
-                entry["gate"] = 0
-            entry["by"] = entry.get("by", "").lower()
-            entries.append(entry)
-    return entries
 
 
 def risk_of(change_dir):
@@ -283,17 +269,17 @@ def risk_of(change_dir):
     return "low"
 
 
+def parse_risk_paths(text):
+    """Globs from the text of docs/risk-paths (one per line, # comments)."""
+    return [g for g in (line.split("#", 1)[0].strip() for line in text.splitlines()) if g]
+
+
 def read_risk_paths(root=ROOT):
-    """Globs from docs/risk-paths (one per line, # comments)."""
     path = os.path.join(root, "docs", "risk-paths")
-    globs = []
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.split("#", 1)[0].strip()
-                if line:
-                    globs.append(line)
-    return globs
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as fh:
+        return parse_risk_paths(fh.read())
 
 
 def _glob_regex(pattern):
@@ -533,9 +519,21 @@ def python_imports(path):
     return names
 
 
-def git_out(args, cwd):
-    res = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True, check=False)
+def git_out(args, cwd=ROOT, text=True, env=None):
+    """The one place the kit runs git: (returncode, stdout, stderr), stripped when text. No git: returncode 127."""
+    try:
+        res = subprocess.run(["git"] + list(args), cwd=cwd, capture_output=True, text=text, env=env, check=False)
+    except OSError as exc:
+        return 127, "" if text else b"", str(exc)
+    if not text:
+        return res.returncode, res.stdout, res.stderr
     return res.returncode, res.stdout.strip(), res.stderr.strip()
+
+
+def show(ref, path, root=ROOT):
+    """The bytes of `path` at `ref`, or None when the ref or the file does not exist."""
+    rc, out, _ = git_out(["show", "%s:%s" % (ref, path)], root, text=False)
+    return out if rc == 0 else None
 
 
 def run_parallel_isolated(change_dir, parts, base, owners=None):
@@ -592,7 +590,7 @@ def run_parallel_isolated(change_dir, parts, base, owners=None):
 
 
 def cmd_parallel_check(args):
-    run, base = False, "main"
+    run, base = False, None
     rest = []
     i = 0
     while i < len(args):
@@ -653,17 +651,17 @@ def cmd_parallel_check(args):
     print("OK: each part's tests import only its own files (%s)"
           % ", ".join(part_label(n, owners) for n in parts))
     if run:
+        if base is None:  # default: the trusted base from pod.yml (change 009)
+            base, problem = trusted_base(read_pod_yml())
+            if problem:
+                print("Refused: " + problem, file=sys.stderr)
+                return 1
         return run_parallel_isolated(change_dir, parts, base, owners)
     return 0
 
 
 def git_email(root=ROOT):
-    try:
-        out = subprocess.run(["git", "config", "user.email"], cwd=root,
-                             capture_output=True, text=True, check=False)
-        return out.stdout.strip().lower()
-    except OSError:
-        return ""
+    return git_out(["config", "user.email"], root)[1].lower()
 
 
 def role_for(cfg, gate, email):
@@ -708,8 +706,43 @@ def expected_emails(cfg, gate, role):
     return role_emails(cfg, {"owner": owner, "cross": cross, "escalation": "escalation"}[role])
 
 
+BASE_PREFIXES = ("refs/heads/", "refs/remotes/origin/", "remotes/origin/", "heads/", "origin/", "./")
+PLAIN_BRANCH = re.compile(r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$")
+
+
+def base_problem(cfg):
+    """Why base_branch cannot be trusted, or None. The one place for this rule (change 008): it must be a plain
+    branch name, never a change branch in any spelling, and in CI it must be the branch the pull request
+    merges into. A branch made at HEAD under another name is caught only in CI (spec 008, Out of scope)."""
+    name = cfg["base_branch"]
+    plain = name
+    stripped = True
+    while stripped:
+        stripped = False
+        for prefix in BASE_PREFIXES:
+            if plain.startswith(prefix):
+                plain, stripped = plain[len(prefix):], True
+    if not PLAIN_BRANCH.match(plain) or ".." in plain or plain.startswith("-") or plain in ("HEAD", "@"):
+        return "base_branch: %s is not a plain branch name" % name
+    if plain.lower().startswith("change/"):
+        return ("base_branch: %s is a change branch; the base must be the shared branch changes merge into "
+                "(pod.yml base_branch, default main)" % name)
+    ci = ci_base_ref()
+    if ci and ci != plain:
+        return "base_branch: %s does not match the pull request's base branch %s" % (name, ci)
+    return None
+
+
+def trusted_base(cfg, root=ROOT):
+    """(base ref, None), or (None, problem) when base_branch cannot be trusted (change 008)."""
+    problem = base_problem(cfg)
+    return (None, problem) if problem else (resolve_base(cfg["base_branch"], root), None)
+
+
 def resolve_base(base, root=ROOT):
-    """origin/<base> when that ref exists, else <base>."""
+    """origin/<base> when that ref exists, else <base>. In CI the pull request's real base wins over pod.yml,
+    so a change cannot point the base at itself (change 008)."""
+    base = ci_base_ref() or base
     if not base.startswith("origin/") and git_out(["rev-parse", "--verify", "--quiet",
                                                    "origin/%s^{commit}" % base], root)[0] == 0:
         return "origin/" + base
@@ -743,7 +776,9 @@ def peer_review_problem(cfg, email, root=ROOT):
     devs = role_emails(cfg, "superdev")
     if len(devs) < 2:
         return None, None
-    ref = resolve_base(cfg["base_branch"], root)
+    ref, problem = trusted_base(cfg, root)
+    if problem:
+        return "Refused: peer review cannot be checked: " + problem, None
     authors, note = code_authors(ref, root)
     if authors is None:
         return None, note
@@ -791,11 +826,11 @@ def mode_record_on_base(change_dir, cfg, root=ROOT):
     """The `event=mode` record of this change as it is on the base branch, or None.
     Only a record that is already on the base branch (a finished, merged change) can outlive a switch back to
     `mode: pod`; a record written on a branch cannot turn Autonomous mode on by itself."""
-    rel = os.path.relpath(os.path.join(change_dir, "gates.log"), root)
-    rc, text, _ = git_out(["show", "%s:%s" % (resolve_base(cfg["base_branch"], root), rel)], root)
-    if rc != 0:
+    base, problem = trusted_base(cfg, root)
+    data = None if problem else show(base, os.path.relpath(os.path.join(change_dir, "gates.log"), root), root)
+    if data is None:
         return None
-    for line in text.splitlines():
+    for line in data.decode("utf-8", "replace").splitlines():
         if line.startswith("event=mode "):
             try:
                 return dict(p.split("=", 1) for p in shlex.split(line) if "=" in p)
@@ -821,21 +856,16 @@ def plan_merged_as_is(change_dir, cfg, roles, blob, root=ROOT):
     """True when the base branch already holds this plan.md (same blob) and, for every role, its latest gate 3
     signature for that blob. Such a plan passed CI when it merged, so plan rules added by a later kit do not fail
     it (change 007). Anything only on a branch or in the working tree is still checked."""
-    name = cfg["base_branch"]
-    if name.startswith("change/") or (ci_base_ref() or name) != name:
-        return False  # a change cannot name its own branch as the base (CI knows the real one)
-    base = resolve_base(name, root)
+    base, problem = trusted_base(cfg, root)
+    if problem:
+        return False
     folder = os.path.relpath(change_dir, root)
-    try:
-        plan = subprocess.run(["git", "show", "%s:%s/plan.md" % (base, folder)], cwd=root, capture_output=True)
-        log = subprocess.run(["git", "show", "%s:%s/gates.log" % (base, folder)], cwd=root, capture_output=True)
-    except OSError:
+    plan, log = show(base, folder + "/plan.md", root), show(base, folder + "/gates.log", root)
+    if plan is None or log is None:
         return False
-    if plan.returncode != 0 or log.returncode != 0:
+    if hashlib.sha1(b"blob %d\0" % len(plan) + plan).hexdigest() != blob:
         return False
-    if hashlib.sha1(b"blob %d\0" % len(plan.stdout) + plan.stdout).hexdigest() != blob:
-        return False
-    latest = {e["role"]: e.get("blob") for e in parse_log(log.stdout.decode("utf-8", "replace"))
+    latest = {e["role"]: e.get("blob") for e in parse_log(log.decode("utf-8", "replace"))
               if e["gate"] == 3 and "role" in e}
     return all(latest.get(role) == blob for role in roles)
 
@@ -987,12 +1017,7 @@ def log_ignored(change_dir, name="gates.log"):
     """True when git would ignore this change's `name` (gates.log by default, or activity.log), e.g. through a
     global *.log rule. Ignored approvals never reach the other person or CI, so the cross-gate silently fails."""
     path = os.path.join(change_dir, name)
-    try:
-        res = subprocess.run(["git", "check-ignore", "-q", path], cwd=ROOT,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError:
-        return False
-    return res.returncode == 0
+    return git_out(["check-ignore", "-q", path])[0] == 0
 
 
 ACTIVITY_IGNORED_HINT = ("activity.log is ignored by git (often a global *.log rule), so it would never be shared. "
@@ -1053,13 +1078,8 @@ def known_changes(root, scratch):
     `change/NNN-slug` branches, then remote-tracking ones as last fetched. A branch's gates.log and intent.md
     are copied from its tip into `scratch`, without a checkout. folder is None when the branch has no folder."""
     known = {os.path.basename(d): ("working tree", d) for d in change_dirs(root)}
-    try:
-        out = subprocess.run(["git", "for-each-ref", "--format=%(refname)", "refs/heads/change/", "refs/remotes/"],
-                             cwd=root, capture_output=True, text=True).stdout
-        head = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=root, capture_output=True,
-                              text=True).stdout.strip()
-    except OSError:  # no git: the working tree only, as before
-        out, head = "", ""
+    out = git_out(["for-each-ref", "--format=%(refname)", "refs/heads/change/", "refs/remotes/"], root)[1]
+    head = git_out(["symbolic-ref", "-q", "HEAD"], root)[1]  # no git: both empty, the working tree only
     # the current branch is the working tree, so `git checkout -b change/007-x` then new-change.sh gives 007
     current = CHANGE_BRANCH.match(head)
     refs = [(m.group(1), m.group(2), ref) for ref in out.split() for m in [CHANGE_BRANCH.match(ref)]
@@ -1071,12 +1091,11 @@ def known_changes(root, scratch):
         folder = os.path.join(scratch, str(len(known)), name)
         found = False
         for fname in ("gates.log", "intent.md"):
-            res = subprocess.run(["git", "show", "%s:docs/changes/%s/%s" % (ref, name, fname)],
-                                 cwd=root, capture_output=True)
-            if res.returncode == 0:
+            data = show(ref, "docs/changes/%s/%s" % (name, fname), root)
+            if data is not None:
                 os.makedirs(folder, exist_ok=True)
                 with open(os.path.join(folder, fname), "wb") as fh:
-                    fh.write(res.stdout)
+                    fh.write(data)
                 found = True
         known[name] = (where, folder if found else None)
     return known
@@ -1287,9 +1306,7 @@ def cmd_metrics(args):
     if not os.path.exists(intent):
         print("intent.md not found in %s" % args[0], file=sys.stderr)
         return 1
-    out = subprocess.run(["git", "log", "--follow", "--format=%cI", "--", intent],
-                         cwd=change_dir, capture_output=True, text=True, check=False)
-    stamps = [s for s in out.stdout.split() if s]
+    stamps = git_out(["log", "--follow", "--format=%cI", "--", intent], change_dir)[1].split()
     if not stamps:
         print("intent.md is not committed yet, so times cannot be computed", file=sys.stderr)
         return 1
